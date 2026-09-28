@@ -12,6 +12,7 @@ on:
       - 'api/**.py'
       - 'server.py'
       - 'tests/browser_conversation_lifecycle.py'
+      - 'tests/sidebar_terminal_barrier_server.py'
       - 'tests/browser_historical_transcript_hydration.py'
       - 'tests/browser_reconnect_scene_redraw.py'
       - 'requirements*.txt'
@@ -24,6 +25,7 @@ on:
       - 'api/**.py'
       - 'server.py'
       - 'tests/browser_conversation_lifecycle.py'
+      - 'tests/sidebar_terminal_barrier_server.py'
       - 'tests/browser_historical_transcript_hydration.py'
       - 'tests/browser_reconnect_scene_redraw.py'
       - 'requirements*.txt'
@@ -84,6 +86,14 @@ jobs:
           LIFECYCLE_ARTIFACT_DIR: lifecycle-artifacts
           LIFECYCLE_SCENARIO: normal
           LIFECYCLE_TEST_BITE: settle-worklog-frame-proof
+        run: python tests/browser_conversation_lifecycle.py
+
+      - name: Recover a missing terminal frame
+        if: matrix.scenario == 'normal'
+        env:
+          LIFECYCLE_ARTIFACT_DIR: lifecycle-artifacts/missing-terminal
+          LIFECYCLE_SCENARIO: normal
+          LIFECYCLE_TEST_BITE: sidebar-idle-missing-terminal
         run: python tests/browser_conversation_lifecycle.py
 
       - name: Upload failure artifacts
