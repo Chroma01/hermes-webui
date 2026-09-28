@@ -23548,6 +23548,7 @@ def _active_stream_blocks_chat_start(session, stream_id: str | None) -> bool:
     """
     if not stream_id:
         return False
+    orphan_released = False
     with STREAMS_LOCK:
         if stream_id in STREAMS:
             try:
@@ -23573,22 +23574,23 @@ def _active_stream_blocks_chat_start(session, stream_id: str | None) -> bool:
             # helper. Lock order stays STREAMS_LOCK -> STREAM_SESSION_OWNERS_LOCK,
             # the order the rest of the lifecycle uses (never the reverse).
             from api import config as _live_config
-            for _orphan_registry in (
-                _live_config.AGENT_INSTANCES,
-                _live_config.CANCEL_FLAGS,
-                _live_config.STREAM_GOAL_RELATED,
-                _live_config.STREAM_PARTIAL_TEXT,
-                _live_config.STREAM_REASONING_TEXT,
-                _live_config.STREAM_LIVE_TOOL_CALLS,
-                _live_config.STREAM_LAST_EVENT_ID,
-                _live_config.STREAMS,
-            ):
-                _orphan_registry.pop(stream_id, None)
+            _orphan_session_id = getattr(session, "session_id", None)
+            # ONE call releases every registry the stream owns
+            # (the shared stream_owned_registries() list + both owner registries) -- the single
+            # teardown entry point, so this path can never clear a hand-picked
+            # subset again. The session writeback entry is compare-and-clear: a
+            # successor admitted after this orphan keeps its registry claim.
+            # STREAMS_LOCK is already held and threading.Lock is not reentrant.
             try:
-                unregister_stream_owner(stream_id)
+                _live_config.release_stream_owned_registries(
+                    stream_id,
+                    session_id=_orphan_session_id,
+                    streams_lock_held=True,
+                )
             except Exception:
                 logger.debug(
-                    "chat/start: could not clear the stream owner for orphan %s",
+                    "chat/start: could not release the stream-owned registries "
+                    "for orphan %s",
                     stream_id,
                     exc_info=True,
                 )
@@ -23596,9 +23598,25 @@ def _active_stream_blocks_chat_start(session, stream_id: str | None) -> bool:
                 "chat/start: cleared orphaned stream %s for session %s "
                 "(no live worker, no pending turn in the registration window)",
                 stream_id,
-                getattr(session, "session_id", "?"),
+                _orphan_session_id or "?",
             )
-            return False
+            orphan_released = True
+    if orphan_released:
+        # Gateway-owned rows (run lifecycle / run id / endpoint) live in
+        # api/gateway_chat.py and are released through their no-op-safe
+        # lifecycle/waiter path, which must NOT run nested under STREAMS_LOCK:
+        # the canonical Gateway teardown releases that lock before the same step.
+        try:
+            from api.gateway_chat import release_gateway_stream_state
+
+            release_gateway_stream_state(stream_id)
+        except Exception:
+            logger.debug(
+                "chat/start: could not release the Gateway state for orphan %s",
+                stream_id,
+                exc_info=True,
+            )
+        return False
     try:
         with ACTIVE_RUNS_LOCK:
             if stream_id in (ACTIVE_RUNS or {}):

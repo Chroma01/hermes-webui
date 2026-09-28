@@ -26,6 +26,7 @@ import time
 import pytest
 
 import api.config as config
+import api.gateway_chat as gateway_chat
 import api.routes as routes
 from api.models import _REPAIR_STALE_PENDING_GRACE_SECONDS
 
@@ -65,6 +66,63 @@ def _reset_registries():
     config.ACTIVE_RUNS.clear()
     config.STREAM_SESSION_OWNERS.clear()
     config.SESSION_AGENT_LOCKS.clear()
+    # #7302 re-gate: the orphan teardown now owns EVERY per-stream registry, so
+    # the fixture resets every one of them -- driven by the production tuple, so
+    # a registry added later cannot be seeded by the fixture and left dirty (or
+    # the reverse).
+    for _registry in config.stream_owned_registries():
+        _registry.clear()
+    config.SESSION_WRITEBACK_OWNERS.clear()
+    gateway_chat._STREAM_RUN_IDS.clear()
+    gateway_chat._STREAM_RUN_LIFECYCLE.clear()
+    gateway_chat._STREAM_ENDPOINTS.clear()
+
+
+def _seed_stream_owned_state(stream_id, *, session_id, writeback=True):
+    """Seed every registry a stream can own: the full set, no hand-picked subset.
+
+    ``writeback`` controls whether this stream is the session's current
+    writeback owner (the compare-and-clear arm).
+    """
+    config.STREAMS[stream_id] = queue.Queue()
+    config.AGENT_INSTANCES[stream_id] = object()
+    config.CANCEL_FLAGS[stream_id] = object()
+    config.STREAM_GOAL_RELATED[stream_id] = True
+    config.STREAM_PARTIAL_TEXT[stream_id] = "half a turn"
+    config.STREAM_REASONING_TEXT[stream_id] = "thinking..."
+    config.STREAM_LIVE_TOOL_CALLS[stream_id] = [{"name": "run_shell"}]
+    config.STREAM_LAST_EVENT_ID[stream_id] = "evt-1"
+    config.STREAM_SESSION_OWNERS[stream_id] = session_id
+    if writeback:
+        config.SESSION_WRITEBACK_OWNERS[session_id] = stream_id
+    # Gateway-owned rows: the orphan path must retire these through the
+    # lifecycle/waiter protocol, not by leaving them behind (or raw-popping a
+    # row a parked waiter still owns).
+    gateway_chat._STREAM_RUN_IDS[stream_id] = "run-" + stream_id
+    gateway_chat._STREAM_RUN_LIFECYCLE[stream_id] = {
+        "phase": "pending",
+        "run_id": "",
+        "waiters": 0,
+        "owner_done": False,
+    }
+    gateway_chat._STREAM_ENDPOINTS[stream_id] = ("http://gateway.invalid", "key-" + stream_id)
+
+
+def _leaked_stream_rows(stream_id):
+    """Every registry still holding ``stream_id`` (production tuple + owners + gateway)."""
+    names = []
+    for idx, registry in enumerate(config.stream_owned_registries()):
+        if stream_id in registry:
+            names.append("stream_owned_registries()[%d]" % idx)
+    if stream_id in config.STREAM_SESSION_OWNERS:
+        names.append("STREAM_SESSION_OWNERS")
+    if stream_id in gateway_chat._STREAM_RUN_IDS:
+        names.append("_STREAM_RUN_IDS")
+    if stream_id in gateway_chat._STREAM_RUN_LIFECYCLE:
+        names.append("_STREAM_RUN_LIFECYCLE")
+    if stream_id in gateway_chat._STREAM_ENDPOINTS:
+        names.append("_STREAM_ENDPOINTS")
+    return sorted(names)
 
 
 # ── the blocking arms ────────────────────────────────────────────────────────
@@ -403,45 +461,56 @@ def test_orphan_stream_with_a_cancelling_worker_is_not_reaped(monkeypatch, phase
 def test_orphan_clear_releases_every_stream_owned_registry():
     """Recovering an orphan must not leak the dead turn's per-stream state.
 
-    A crashed or wedged worker never reaches its own teardown, so removing only
-    STREAMS + the owner left the agent instance, cancel flag, partial/reasoning
-    text, live tool calls, goal marker and last event id allocated for the life
-    of the process -- one stale set per recovered orphan. The clear mirrors the
-    canonical worker teardown set (api/streaming.py, api/gateway_chat.py).
+    A crashed or wedged worker never reaches its own teardown, so a hand-picked
+    subset left the agent instance, cancel flag, partial/reasoning text, live tool
+    calls, goal marker, last event id, the session's writeback claim and the
+    Gateway run rows allocated for the life of the process -- one stale set per
+    recovered orphan. This seeds the FULL set (the production
+    ``stream_owned_registries()`` tuple, both owner registries, and the Gateway
+    rows), so the regression cannot pass by asserting only the subset the
+    implementation happened to clear.
     """
     _reset_registries()
     stream_id = "orphan-with-residual-state"
-    session = _Session(active_stream_id=stream_id, session_id="residual-state-session")
+    session_id = "residual-state-session"
+    session = _Session(active_stream_id=stream_id, session_id=session_id)
+    _seed_stream_owned_state(stream_id, session_id=session_id)
 
-    config.STREAMS[stream_id] = queue.Queue()
-    config.AGENT_INSTANCES[stream_id] = object()
-    config.CANCEL_FLAGS[stream_id] = object()
-    config.STREAM_GOAL_RELATED[stream_id] = True
-    config.STREAM_PARTIAL_TEXT[stream_id] = "half a turn"
-    config.STREAM_REASONING_TEXT[stream_id] = "thinking..."
-    config.STREAM_LIVE_TOOL_CALLS[stream_id] = [{"name": "run_shell"}]
-    config.STREAM_LAST_EVENT_ID[stream_id] = "evt-1"
-    config.STREAM_SESSION_OWNERS[stream_id] = session.session_id
+    assert routes._active_stream_blocks_chat_start(session, stream_id) is False
 
-    registries = (
-        "STREAMS",
-        "AGENT_INSTANCES",
-        "CANCEL_FLAGS",
-        "STREAM_GOAL_RELATED",
-        "STREAM_PARTIAL_TEXT",
-        "STREAM_REASONING_TEXT",
-        "STREAM_LIVE_TOOL_CALLS",
-        "STREAM_LAST_EVENT_ID",
+    leaked = _leaked_stream_rows(stream_id)
+    assert leaked == [], f"orphan recovery left per-stream state allocated: {leaked}"
+    # The orphan still owned the session's writeback, so compare-and-clear drops it.
+    assert session_id not in config.SESSION_WRITEBACK_OWNERS
+
+
+def test_orphan_clear_spares_a_distinct_successor():
+    """A successor admitted after the orphan keeps every registry it owns.
+
+    The orphan's clear must retire only its OWN rows: a distinct successor's
+    per-stream rows -- and its claim on the SAME session's writeback, which was
+    replaced when the successor was admitted -- must survive. Compare-and-clear
+    is what makes that true; an unconditional pop would strand the successor's
+    live turn.
+    """
+    _reset_registries()
+    session_id = "shared-successor-session"
+    orphan_stream = "orphan-earlier-turn"
+    successor_stream = "successor-live-turn"
+    session = _Session(active_stream_id=orphan_stream, session_id=session_id)
+
+    _seed_stream_owned_state(successor_stream, session_id=session_id)
+    _seed_stream_owned_state(orphan_stream, session_id=session_id, writeback=False)
+    config.SESSION_WRITEBACK_OWNERS[session_id] = successor_stream
+
+    assert routes._active_stream_blocks_chat_start(session, orphan_stream) is False
+
+    leaked = _leaked_stream_rows(orphan_stream)
+    assert leaked == [], f"orphan recovery left per-stream state allocated: {leaked}"
+    assert _leaked_stream_rows(successor_stream) != [], (
+        "orphan recovery wiped a distinct successor's registries"
     )
-    try:
-        assert routes._active_stream_blocks_chat_start(session, stream_id) is False
-
-        leaked = sorted(
-            name for name in registries if getattr(config, name).get(stream_id) is not None
-        )
-        assert leaked == [], f"orphan recovery left per-stream state allocated: {leaked}"
-        assert stream_id not in config.STREAM_SESSION_OWNERS
-    finally:
-        for name in registries:
-            getattr(config, name).pop(stream_id, None)
-        config.STREAM_SESSION_OWNERS.pop(stream_id, None)
+    assert config.SESSION_WRITEBACK_OWNERS.get(session_id) == successor_stream, (
+        "compare-and-clear dropped a successor's writeback claim"
+    )
+    _reset_registries()  # leave no successor rows behind for the next test

@@ -11059,6 +11059,74 @@ STREAM_GOAL_RELATED: dict = {}  # stream_id -> bool: only evaluate goal for goal
 STREAM_LAST_EVENT_ID: dict = {}  # stream_id -> latest journal event_id for `id:` field on live SSE frames (stage-364)
 PENDING_GOAL_CONTINUATION: set = set()  # session_ids awaiting a goal continuation turn (#1932)
 
+# ── THE list of per-stream registries (#7302 re-gate) ───────────────────────
+# Every registry a stream owns. Both the local worker teardown (api/streaming.py)
+# and the chat/start orphan recovery (api/routes.py) iterate THIS list instead of
+# hand-maintained pop lists, so a new per-stream registry cannot be added to one
+# teardown path and silently forgotten in the other.
+def stream_owned_registries() -> tuple:
+    """The per-stream registries, resolved on EVERY call.
+
+    Deliberately a function, not a module-level constant: a frozen tuple holds
+    the dict objects that existed at import time, so rebinding a registry
+    (``config.STREAMS = {...}``) would leave every teardown popping the stale
+    dict and leaking the live one. Module-level attribute lookup keeps the list
+    in step with whichever object is current.
+    """
+    return (
+        STREAMS,
+        AGENT_INSTANCES,
+        CANCEL_FLAGS,
+        STREAM_GOAL_RELATED,
+        STREAM_PARTIAL_TEXT,
+        STREAM_REASONING_TEXT,
+        STREAM_LIVE_TOOL_CALLS,
+        STREAM_LAST_EVENT_ID,
+    )
+
+
+def _release_stream_owned_rows(stream_id: str, session_id: str | None) -> None:
+    """Drop this stream's rows from every registry. Caller holds the locks."""
+    for _registry in stream_owned_registries():
+        _registry.pop(stream_id, None)
+    # Owner registries. The writeback entry is compare-and-clear: a successor
+    # admitted after cancel must keep its registry claim (#6623 re-gate).
+    unregister_stream_owner(stream_id)
+    if session_id:
+        try:
+            clear_session_writeback_owner_if_owned(session_id, stream_id)
+        except Exception:
+            logger.debug(
+                "Failed to clear session writeback owner for stream %s", stream_id,
+                exc_info=True,
+            )
+
+
+def release_stream_owned_registries(
+    stream_id: str, *, session_id: str | None = None, streams_lock_held: bool = False
+) -> None:
+    """Release EVERY registry a stream can own -- the single teardown entry point.
+
+    ``streams_lock_held=True`` is for callers already inside ``STREAMS_LOCK``
+    (``threading.Lock`` is not reentrant). Lock order stays
+    ``STREAMS_LOCK -> STREAM_SESSION_OWNERS_LOCK``, the order the rest of the
+    lifecycle uses; ``_release_stream_owned_rows`` never takes a lock itself, so
+    the nesting is the caller's.
+
+    The Gateway-owned rows (``_STREAM_RUN_LIFECYCLE`` / ``_STREAM_RUN_IDS`` /
+    ``_STREAM_ENDPOINTS``) are NOT touched here: they live in api/gateway_chat.py
+    and are released through ``release_gateway_stream_state()``, which uses the
+    lifecycle/waiter protocol and must run OUTSIDE ``STREAMS_LOCK``.
+    """
+    stream_id = str(stream_id or "").strip()
+    if not stream_id:
+        return
+    if streams_lock_held:
+        _release_stream_owned_rows(stream_id, session_id)
+        return
+    with STREAMS_LOCK:
+        _release_stream_owned_rows(stream_id, session_id)
+
 
 def register_stream_owner(stream_id: str, session_id: str) -> None:
     """Record the session that owns a stream before worker startup."""

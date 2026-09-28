@@ -125,6 +125,35 @@ def _clear_gateway_run_starting(stream_id: str) -> None:
         _STREAM_RUN_STARTING_CONDITION.notify_all()
 
 
+def release_gateway_stream_state(stream_id: str, *, finish_pending: bool = True) -> None:
+    """No-op-safe release of the Gateway-owned rows for ``stream_id``.
+
+    THE release path for ``_STREAM_RUN_LIFECYCLE`` / ``_STREAM_RUN_IDS`` /
+    ``_STREAM_ENDPOINTS``: the canonical Gateway worker teardown and the
+    chat/start orphan recovery both call this, so a dead stream cannot leak a
+    lifecycle row, a run-id mapping or an endpoint that no worker will ever free
+    (#7302 re-gate).
+
+    Uses the existing lifecycle/waiter protocol instead of popping rows raw: a
+    request parked in ``wait_for_gateway_run_id`` is never stranded -- it wakes on
+    the terminal phase, and retires the row itself on the way out
+    (``_retire_gateway_run_starting_if_done``), which is why the row can be left
+    in place while ``waiters`` is non-zero.
+
+    ``finish_pending`` publishes the terminal phase for a run that never reached
+    ``ready``. It is a pure no-op for a stream that never touched the Gateway
+    (no lifecycle row, no run id, no endpoint).
+    """
+    stream_id = str(stream_id or "").strip()
+    if not stream_id:
+        return
+    if finish_pending and gateway_run_id_pending(stream_id):
+        _finish_gateway_run_starting(stream_id)
+    _clear_gateway_run_starting(stream_id)
+    with _STREAM_RUN_STARTING_CONDITION:
+        _STREAM_ENDPOINTS.pop(stream_id, None)
+
+
 def gateway_run_id_pending(stream_id: str) -> bool:
     with _STREAM_RUN_STARTING_CONDITION:
         return str((_STREAM_RUN_LIFECYCLE.get(stream_id) or {}).get("phase") or "").strip().lower() == "pending"
@@ -1803,11 +1832,11 @@ def _run_gateway_chat_streaming(
             STREAM_LIVE_TOOL_CALLS.pop(stream_id, None)
             STREAM_LAST_EVENT_ID.pop(stream_id, None)
             STREAMS.pop(stream_id, None)
-        if runs_api_pending_marked and gateway_run_id_pending(stream_id):
-            _finish_gateway_run_starting(stream_id)
-        _clear_gateway_run_starting(stream_id)
-        with _STREAM_RUN_STARTING_CONDITION:
-            _STREAM_ENDPOINTS.pop(stream_id, None)
+        # Shared, no-op-safe release (#7302 re-gate): the chat/start orphan
+        # recovery retires a dead stream's Gateway rows through this same path,
+        # so both teardowns stay one implementation. ``runs_api_pending_marked``
+        # keeps this call site's original finish-pending semantics.
+        release_gateway_stream_state(stream_id, finish_pending=runs_api_pending_marked)
         unregister_stream_owner(stream_id)
         unregister_active_run(stream_id)
         # Release the writeback-owner entry the route layer registered for this
