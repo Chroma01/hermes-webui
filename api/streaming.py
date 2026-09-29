@@ -34,6 +34,7 @@ from api.config import (
     STREAM_GOAL_RELATED, PENDING_GOAL_CONTINUATION,
     STREAM_LAST_EVENT_ID,
     stream_owned_registries,
+    release_stream_owned_registries,
     LOCK, SESSIONS, SESSIONS_MAX, SESSION_DIR,
     _get_session_agent_lock, _alias_session_agent_lock,
     _set_thread_env, _clear_thread_env,
@@ -9750,17 +9751,13 @@ def _run_agent_streaming(
                     backend=WEBUI_LOCAL_CHAT_BACKEND,
                 )
     if q is None:
-        # The stream was cancelled before the worker started; the route layer
-        # already registered the stream owner, so release it here to avoid
-        # leaking a STREAM_SESSION_OWNERS entry that the teardown finally never sees.
-        unregister_stream_owner(stream_id)
-        try:
-            clear_session_writeback_owner_if_owned(session_id, stream_id)
-        except Exception:
-            logger.debug(
-                "Failed to clear session writeback owner for stream %s", stream_id,
-                exc_info=True,
-            )
+        # The stream was cancelled (or cleared as an orphan) before this worker
+        # was admitted, so no teardown finally will ever run for it: release
+        # EVERY registry the route layer registered for the stream, not just the
+        # owner and writeback rows. STREAM_GOAL_RELATED is written before worker
+        # admission (api/routes.py `_start_chat_stream_for_session`), so a
+        # pre-start cancellation otherwise strands it for the process lifetime.
+        release_stream_owned_registries(stream_id, session_id=session_id)
         return
     try:
         run_journal = RunJournalWriter(session_id, stream_id)

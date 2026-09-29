@@ -31,6 +31,7 @@ from api.config import (
     gateway_supports_approval,
     peek_stream,
     register_active_run,
+    release_stream_owned_registries,
     unregister_active_run,
     unregister_stream_owner,
     update_active_run,
@@ -1232,12 +1233,15 @@ def _run_gateway_chat_streaming(
     if q is None:
         _finish_gateway_run_starting(stream_id, result="fallback")
         _clear_gateway_run_starting(stream_id)
-        # Cancelled or orphan-cleared before the worker started; release the owner
-        # entries the route layer registered so STREAM_SESSION_OWNERS and
-        # SESSION_WRITEBACK_OWNERS do not leak (no teardown finally runs on this
-        # early-return path).
-        unregister_stream_owner(stream_id)
-        clear_session_writeback_owner_if_owned(session_id, stream_id)
+        # Cancelled or orphan-cleared before the worker was admitted: no teardown
+        # finally runs on this early-return path, so release the COMPLETE set of
+        # stream-owned registries the route layer registered (stream rows,
+        # owners, writeback, goal classification) and then the Gateway-owned
+        # lifecycle rows. release_gateway_stream_state() is no-op-safe and must
+        # run OUTSIDE STREAMS_LOCK -- it owns the lifecycle/waiter protocol and
+        # also drops the endpoint mapping the old owner-only release leaked.
+        release_stream_owned_registries(stream_id, session_id=session_id)
+        release_gateway_stream_state(stream_id)
         return
     try:
         run_journal = RunJournalWriter(session_id, stream_id)
