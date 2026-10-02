@@ -201,6 +201,11 @@
   open the hidden file picker. The closed drawer is now out of the tab order and ignores taps; the
   slide animation and the open drawer are unchanged. Thanks @happy5318. (#7866, closes #7713)
 
+- **The conversation-lifecycle check catches a reload that drops the terminal row's clock again.** The minute-boundary
+  flake fix compared the settled and reloaded terminal rows with the trailing clock stripped, so a reload that lost
+  the clock entirely also passed. The check now compares the row label and requires a clock on both sides, while
+  still allowing the clock value to differ, and it rejects empty row ids. Test-only. Thanks @happy5318. (#7808)
+
 - **The conversation-lifecycle browser check no longer flakes at a minute boundary.** It compared a
   settled terminal row's text with the same row after a reload, and the trailing rendered clock
   (`12:34 PM` → `12:35 PM`) made them differ whenever the reload crossed a minute. It now strips only
