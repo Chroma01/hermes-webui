@@ -338,6 +338,23 @@ class SessionChannel:
         with self._lock:
             return self._closed
 
+    @staticmethod
+    def _queue_has_capacity(q: queue.Queue) -> bool:
+        """True when ``q`` has a free slot, i.e. its consumer drained something.
+
+        Only the consumer ever removes items, so a queue that is no longer full
+        proves the subscriber dequeued at least one event after the ``queue.Full``
+        that opened its stall run. ``maxsize <= 0`` is unbounded and can never be
+        full, so it always counts as draining.
+        """
+        maxsize = int(getattr(q, "maxsize", 0) or 0)
+        if maxsize <= 0:
+            return True
+        try:
+            return q.qsize() < maxsize
+        except Exception:
+            return False
+
     def _dead_subscriber_signal(self, now: float) -> bool:
         """Positive evidence that EVERY attached subscriber is dead/stuck.
 
@@ -357,6 +374,16 @@ class SessionChannel:
         from api import config as _cfg
 
         sub_count = len(self._subscribers)
+        # A dequeue is progress (review #7302, finding 1). ``_handle_session_sse_stream``
+        # drains with ``q.get()``, which cannot clear the run that ``emit()`` opened on
+        # ``queue.Full``: a subscriber that drained its whole backlog after a burst and
+        # then received no further event -- a quiet session, the normal case -- kept the
+        # run and was reaped as dead. Free space in the queue is the proof the emit path
+        # cannot see, so sample it here, under the same ``self._lock`` the emit path
+        # records the run with.
+        for q in self._subscribers:
+            if q in self._stalled_since and self._queue_has_capacity(q):
+                self._stalled_since.pop(q, None)
         stalled = [
             self._stalled_since[q]
             for q in self._subscribers
