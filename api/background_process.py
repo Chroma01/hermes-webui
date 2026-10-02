@@ -187,39 +187,49 @@ class SessionChannel:
             return len(self._subscribers)
 
     def emit(self, event: str, data: Any) -> int:
-        """Broadcast (event, data) to all live subscribers. Returns delivered count."""
+        """Broadcast (event, data) to all live subscribers. Returns delivered count.
+
+        The broadcast and its stall bookkeeping are ONE ``self._lock`` transition
+        (re-gate finding 4). ``put_nowait`` never blocks, so holding the lock
+        across it cannot park the channel -- what it buys is that the reaper,
+        which revalidates eligibility and claims the collection under this same
+        lock, can only observe the pre-put state or the state where the record is
+        already cleared by the put that revived the subscriber. Taking the lock
+        again after the put left a window where a subscriber that had just
+        drained, and was refilled by this very put, looked full again with a
+        stale stall record, and the reaper evicted the completion it had just
+        accepted to make room for the close sentinel.
+        """
         delivered = 0
+        now = time.time()
         with self._lock:
             subs = list(self._subscribers)
             self.last_event_at = time.time()
-        now = time.time()
-        for q in subs:
-            try:
-                q.put_nowait((event, data))
-                delivered += 1
-                # Drained — any previous stall run is over. A live tab lands
-                # here on every event, which is exactly why the stall window
-                # below can never be reached by a healthy connection.
-                with self._lock:
+            for q in subs:
+                try:
+                    q.put_nowait((event, data))
+                    delivered += 1
+                    # Drained — any previous stall run is over. A live tab lands
+                    # here on every event, which is exactly why the stall window
+                    # below can never be reached by a healthy connection.
                     self._stalled_since.pop(q, None)
-            except queue.Full:
-                # Slow tab: drop this event for that tab. SSE-level disconnect
-                # detection will eventually tear the connection down and the
-                # browser will reconnect, replaying the live stream from
-                # whatever fires next. process_complete is intrinsically
-                # idempotent (frontend dedupes by ``(session_id, event_id)``
-                # using a small ring-buffer in static/messages.js — see the
-                # bg_task_complete consumer-side dedupe introduced in PR #2971).
-                #
-                # Record the START of the stall run. If this queue
-                # keeps rejecting for the whole stall window it becomes positive
-                # evidence that the subscriber is dead rather than merely slow,
-                # which is the only signal allowed to evict a subscribed channel.
-                with self._lock:
+                except queue.Full:
+                    # Slow tab: drop this event for that tab. SSE-level disconnect
+                    # detection will eventually tear the connection down and the
+                    # browser will reconnect, replaying the live stream from
+                    # whatever fires next. process_complete is intrinsically
+                    # idempotent (frontend dedupes by ``(session_id, event_id)``
+                    # using a small ring-buffer in static/messages.js — see the
+                    # bg_task_complete consumer-side dedupe introduced in PR #2971).
+                    #
+                    # Record the START of the stall run. If this queue
+                    # keeps rejecting for the whole stall window it becomes positive
+                    # evidence that the subscriber is dead rather than merely slow,
+                    # which is the only signal allowed to evict a subscribed channel.
                     self._stalled_since.setdefault(q, now)
-                logger.debug("SessionChannel emit: subscriber buffer full, dropping")
-            except Exception:
-                logger.debug("SessionChannel emit failed", exc_info=True)
+                    logger.debug("SessionChannel emit: subscriber buffer full, dropping")
+                except Exception:
+                    logger.debug("SessionChannel emit failed", exc_info=True)
         return delivered
 
     def close(self, reason: str = "") -> int:
