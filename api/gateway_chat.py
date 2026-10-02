@@ -1041,27 +1041,73 @@ def _resume_gateway_run_for_session(session) -> bool:
         return False
     sid = session.session_id
     endpoint = _gateway_endpoint_for_profile(session.profile)
+    # Review #7302 (nesquena, 01-Oct-2026) finding 2 -- "CORE": publish the
+    # reattached run's ownership (ACTIVE_RUNS row + retained cancel signal) on the
+    # SAME STREAMS_LOCK -> ACTIVE_RUNS_LOCK edge that creates the STREAMS entry,
+    # BEFORE the worker is scheduled. A run restored after a restart carries the
+    # PREVIOUS process's session.pending_started_at, so the fresh-pending guard in
+    # chat/start cannot cover this window: with the stream registered but no
+    # ACTIVE_RUNS row, the orphan check classifies the reattach as an orphan,
+    # clears the stream plus the Gateway state and admits a SECOND start while the
+    # remote run keeps going. The edge and the lock order are the ones the worker
+    # (below), Stop and Steer use.
     with STREAMS_LOCK:
         if stream_id in STREAMS:
             return False
         STREAMS[stream_id] = create_stream_channel()
+        CANCEL_FLAGS[stream_id] = CANCEL_FLAGS.get(stream_id, threading.Event())
+        register_active_run(
+            stream_id,
+            session_id=sid,
+            started_at=time.time(),
+            phase="gateway-reattached",
+            workspace=str(session.workspace or ""),
+            model=session.model,
+            provider=session.model_provider,
+            backend="gateway",
+        )
     register_stream_owner(stream_id, sid)
     register_session_writeback_owner(sid, stream_id)
     _mark_gateway_run_starting(stream_id)
-    threading.Thread(
-        target=_run_gateway_chat_streaming,
-        args=(sid, session.pending_user_message or "", session.model, session.workspace,
-              stream_id, list(session.pending_attachments or [])),
-        kwargs={
-            "model_provider": session.model_provider,
-            "goal_related": bool(run.get("goal_related")),
-            "regeneration": bool(run.get("regeneration")),
-            "reattach_run": run,
-            "reattach_endpoint": endpoint,
-        },
-        name=f"gateway-reattach-{stream_id[:12]}",
-        daemon=True,
-    ).start()
+    try:
+        threading.Thread(
+            target=_run_gateway_chat_streaming,
+            args=(sid, session.pending_user_message or "", session.model, session.workspace,
+                  stream_id, list(session.pending_attachments or [])),
+            kwargs={
+                "model_provider": session.model_provider,
+                "goal_related": bool(run.get("goal_related")),
+                "regeneration": bool(run.get("regeneration")),
+                "reattach_run": run,
+                "reattach_endpoint": endpoint,
+            },
+            name=f"gateway-reattach-{stream_id[:12]}",
+            daemon=True,
+        ).start()
+    except Exception:
+        # A reattach whose worker could not be scheduled must not leave the
+        # ownership claim behind (the caller is told to retry/fall back instead of
+        # reporting a live reattach). Mirror the worker's own early-return
+        # teardown, plus the ACTIVE_RUNS row published above.
+        logger.warning(
+            "gateway reattach: could not start the worker for stream %s", stream_id,
+            exc_info=True,
+        )
+        _finish_gateway_run_starting(stream_id, result="failed")
+        _clear_gateway_run_starting(stream_id)
+        try:
+            unregister_active_run(stream_id)
+        except Exception:
+            logger.debug("gateway reattach: could not drop the active run for %s", stream_id, exc_info=True)
+        try:
+            release_stream_owned_registries(stream_id, session_id=sid)
+        except Exception:
+            logger.debug("gateway reattach: could not release the stream-owned registries for %s", stream_id, exc_info=True)
+        try:
+            release_gateway_stream_state(stream_id)
+        except Exception:
+            logger.debug("gateway reattach: could not release the Gateway state for %s", stream_id, exc_info=True)
+        return False
     return True
 
 def _settle_gateway_terminal_error(
