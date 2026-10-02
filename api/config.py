@@ -11792,6 +11792,37 @@ def unregister_active_run(stream_id: str) -> None:
         LAST_RUN_FINISHED_AT = time.time()
     unregister_stream_owner(stream_id)
 
+
+def unregister_active_run_if_owned(stream_id: str, *, claim_token: str | None = None) -> bool:
+    """Retire an active-run row only while it is still the caller's own claim.
+
+    ``Stop`` (``cancel_stream``) deliberately leaves the row behind in
+    ``phase="cancelling"`` so recovery/health polling sees the detached run while
+    the worker unwinds; the worker's normal ``finally`` retires it and stamps
+    ``LAST_RUN_FINISHED_AT``. A worker cancelled BEFORE it admits the stream takes
+    the early-return path, which never reaches that ``finally`` -- so the claim
+    published before the worker was scheduled has to be retired here, BY IDENTITY,
+    so a row that a successor legitimately registered for the same stream id is
+    never deleted. Returns True when this call retired the row.
+
+    ``unregister_stream_owner`` is deliberately NOT called: the owner registry is a
+    stream-owned registry (already released by ``release_stream_owned_registries``)
+    and a successor may own it.
+    """
+    if not stream_id:
+        return False
+    global LAST_RUN_FINISHED_AT
+    with ACTIVE_RUNS_LOCK:
+        entry = ACTIVE_RUNS.get(stream_id)
+        if entry is None:
+            return False
+        if claim_token is not None:
+            if not isinstance(entry, dict) or str(entry.get("claim_token") or "") != str(claim_token):
+                return False
+        ACTIVE_RUNS.pop(stream_id, None)
+        LAST_RUN_FINISHED_AT = time.time()
+    return True
+
 # Agent cache: reuse AIAgent across messages in the same WebUI session so that
 # _user_turn_count survives between turns.  This mirrors the gateway's
 # _agent_cache pattern and is required for injectionFrequency: "first-turn".

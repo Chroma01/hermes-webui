@@ -33,6 +33,7 @@ from api.config import (
     register_active_run,
     release_stream_owned_registries,
     unregister_active_run,
+    unregister_active_run_if_owned,
     unregister_stream_owner,
     update_active_run,
 )
@@ -1056,11 +1057,16 @@ def _resume_gateway_run_for_session(session) -> bool:
             return False
         STREAMS[stream_id] = create_stream_channel()
         CANCEL_FLAGS[stream_id] = CANCEL_FLAGS.get(stream_id, threading.Event())
+        # Ownership token: Stop can detach this stream (and a successor could even
+        # register the same id) before the worker admits it, so the early-return
+        # teardown must retire exactly THIS claim and never someone else's row.
+        claim_token = uuid.uuid4().hex
         register_active_run(
             stream_id,
             session_id=sid,
             started_at=time.time(),
             phase="gateway-reattached",
+            claim_token=claim_token,
             workspace=str(session.workspace or ""),
             model=session.model,
             provider=session.model_provider,
@@ -1080,6 +1086,7 @@ def _resume_gateway_run_for_session(session) -> bool:
                 "regeneration": bool(run.get("regeneration")),
                 "reattach_run": run,
                 "reattach_endpoint": endpoint,
+                "reattach_claim_token": claim_token,
             },
             name=f"gateway-reattach-{stream_id[:12]}",
             daemon=True,
@@ -1096,7 +1103,7 @@ def _resume_gateway_run_for_session(session) -> bool:
         _finish_gateway_run_starting(stream_id, result="failed")
         _clear_gateway_run_starting(stream_id)
         try:
-            unregister_active_run(stream_id)
+            unregister_active_run_if_owned(stream_id, claim_token=claim_token)
         except Exception:
             logger.debug("gateway reattach: could not drop the active run for %s", stream_id, exc_info=True)
         try:
@@ -1250,6 +1257,7 @@ def _run_gateway_chat_streaming(
     regeneration=False,
     reattach_run=None,
     reattach_endpoint=None,
+    reattach_claim_token=None,
 ):
     """Bridge a WebUI chat turn through Hermes Gateway's API server.
 
@@ -1302,6 +1310,26 @@ def _run_gateway_chat_streaming(
         # lifecycle rows. release_gateway_stream_state() is no-op-safe and must
         # run OUTSIDE STREAMS_LOCK -- it owns the lifecycle/waiter protocol and
         # also drops the endpoint mapping the old owner-only release leaked.
+        # Stop can detach this stream between the pre-admission claim and this
+        # admission (review 2026-10-01, third finding): cancel_stream() marks the
+        # row cancelling and pops STREAMS/CANCEL_FLAGS while this worker is still
+        # unwinding, and this early return never reaches the worker's `finally`.
+        # Retire exactly the claim we published, by identity -- a row a successor
+        # registered for the same stream id must survive. Without this the ghost
+        # row reports false liveness/busy in _run_lifecycle_health() and delays
+        # background wakeups (LAST_RUN_FINISHED_AT never advances).
+        if reattach_claim_token:
+            try:
+                if unregister_active_run_if_owned(stream_id, claim_token=reattach_claim_token):
+                    logger.info(
+                        "gateway reattach: retired the pre-admission claim for stream %s "
+                        "after cancellation", stream_id,
+                    )
+            except Exception:
+                logger.debug(
+                    "gateway reattach: could not retire the pre-admission claim for %s",
+                    stream_id, exc_info=True,
+                )
         release_stream_owned_registries(stream_id, session_id=session_id)
         release_gateway_stream_state(stream_id)
         return

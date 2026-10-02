@@ -67,6 +67,7 @@ def _reset_registries():
 @pytest.fixture(autouse=True)
 def _isolated_registries(monkeypatch):
     _reset_registries()
+    config.LAST_RUN_FINISHED_AT = None
     # Endpoint resolution touches profiles/config; irrelevant to the invariant.
     monkeypatch.setattr(
         gateway_chat, "_gateway_endpoint_for_profile", lambda profile: ("http://gw", "k")
@@ -148,15 +149,21 @@ def test_restarted_run_with_a_stale_pending_timestamp_is_not_orphaned(monkeypatc
     assert STREAM_ID in config.STREAMS, "the orphan check cleared a live reattach"
 
 
-def test_reattach_releases_its_claim_when_the_worker_cannot_be_scheduled(monkeypatch):
-    """A failed launch must leave no ownership behind."""
+def test_reattach_releases_its_claim_when_the_thread_cannot_be_started(monkeypatch):
+    """A real ``Thread.start()`` failure must leave no ownership behind."""
     monkeypatch.setattr(gateway_chat, "_gateway_endpoint_for_profile", lambda profile: ("http://gw", "k"))
     session = _FakeSession(pending_started_at=time.time() - 3600)
 
-    def exploding_thread(*args, **kwargs):
-        raise RuntimeError("cannot start new thread")
+    class _ExplodingStartThread:
+        """Constructs fine (like the real thread object) and fails on start()."""
 
-    monkeypatch.setattr(gateway_chat.threading, "Thread", exploding_thread)
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self):
+            raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(gateway_chat.threading, "Thread", _ExplodingStartThread)
 
     assert gateway_chat._resume_gateway_run_for_session(session) is False
 
@@ -168,6 +175,84 @@ def test_reattach_releases_its_claim_when_the_worker_cannot_be_scheduled(monkeyp
         "a failed reattach left the stream owner entry behind"
     )
     assert STREAM_ID not in config.CANCEL_FLAGS, "a failed reattach left its cancel flag behind"
+
+
+def _detach_the_stream_like_stop() -> None:
+    """Reproduce ``cancel_stream()``: mark the row cancelling, pop the transport."""
+    config.update_active_run(STREAM_ID, phase="cancelling", cancelled_at=time.time())
+    with config.STREAMS_LOCK:
+        config.STREAMS.pop(STREAM_ID, None)
+        config.CANCEL_FLAGS.pop(STREAM_ID, None)
+
+
+def test_stop_before_worker_admission_retires_the_prepublished_claim(monkeypatch):
+    """reattach-scheduled -> Stop -> worker admitted: no ghost row, no false busy.
+
+    ``cancel_stream()`` leaves the ACTIVE_RUNS row in ``phase="cancelling"`` for the
+    worker's ``finally`` to retire, but a worker that is cancelled before it admits
+    the stream takes the q-is-None early return, which never reaches that ``finally``.
+    The claim published before the worker was scheduled must be retired there, or the
+    row reports false liveness (``_run_lifecycle_health``) and delays wakeups because
+    ``LAST_RUN_FINISHED_AT`` never advances.
+    """
+    _RecordingThread.launched = []
+    monkeypatch.setattr(gateway_chat.threading, "Thread", _RecordingThread)
+    session = _FakeSession(pending_started_at=time.time() - 3600)
+
+    assert gateway_chat._resume_gateway_run_for_session(session) is True
+    assert STREAM_ID in config.ACTIVE_RUNS, "the reattach did not publish its claim"
+    worker = _RecordingThread.launched[-1]
+
+    _detach_the_stream_like_stop()
+    gateway_chat._run_gateway_chat_streaming(*worker.args, **worker.kwargs)
+
+    assert STREAM_ID not in config.STREAMS
+    assert STREAM_ID not in config.ACTIVE_RUNS, (
+        "the pre-admission claim survived a Stop: a cancelled ghost row reports false "
+        "liveness and keeps the session looking busy"
+    )
+    assert config.stream_owner_session_id(STREAM_ID) is None
+    assert STREAM_ID not in gateway_chat._STREAM_RUN_LIFECYCLE
+    assert STREAM_ID not in gateway_chat._STREAM_RUN_IDS
+    assert STREAM_ID not in gateway_chat._STREAM_ENDPOINTS
+
+    health = routes._run_lifecycle_health()
+    assert health["active_runs"] == 0, "a ghost active run is still reported as busy"
+    assert health["last_run_finished_at"] is not None, (
+        "the wakeup clock never advanced, so background wakeups stay delayed"
+    )
+    assert routes._active_stream_blocks_chat_start(session, STREAM_ID) is False, (
+        "the retired stream still blocks chat/start"
+    )
+
+
+def test_stop_teardown_never_deletes_a_successors_active_run_row(monkeypatch):
+    """The retirement is by identity: a successor's row for the same id survives."""
+    _RecordingThread.launched = []
+    monkeypatch.setattr(gateway_chat.threading, "Thread", _RecordingThread)
+    session = _FakeSession(pending_started_at=time.time() - 3600)
+
+    assert gateway_chat._resume_gateway_run_for_session(session) is True
+    worker = _RecordingThread.launched[-1]
+
+    # A successor claims the same stream id before our worker unwinds.
+    config.ACTIVE_RUNS[STREAM_ID] = {
+        "stream_id": STREAM_ID,
+        "phase": "gateway-reattached",
+        "claim_token": "successor-token",
+    }
+    with config.STREAMS_LOCK:
+        config.STREAMS.pop(STREAM_ID, None)
+
+    gateway_chat._run_gateway_chat_streaming(*worker.args, **worker.kwargs)
+
+    survivor = config.ACTIVE_RUNS.get(STREAM_ID)
+    assert survivor is not None, (
+        "the early-return teardown deleted a successor's active-run row"
+    )
+    assert survivor.get("claim_token") == "successor-token", (
+        "the early-return teardown deleted a successor's active-run row"
+    )
 
 
 def test_second_reattach_of_the_same_stream_is_refused(monkeypatch):
