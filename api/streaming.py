@@ -8601,32 +8601,45 @@ def _merge_display_messages_after_agent_result(
         # A context tool row whose durable row is already displayed is the same
         # row (e.g. an Agent-pruned summary of the visible full output), never
         # a context-only turn, regardless of how its content was rewritten.
-        _display_durable_tool_rows = {
-            _durable_tool_row_identity(m) for m in previous_display
-        }
-        _display_durable_tool_rows.discard(None)
+        # Map it to its display twin's identity so it is never inserted but
+        # still anchors the backfill cursor at the visible tool result.
+        _display_identity_by_durable_tool_row = {}
+        for m in previous_display:
+            _durable = _durable_tool_row_identity(m)
+            if _durable is not None:
+                _display_identity_by_durable_tool_row.setdefault(_durable, _message_identity(m))
 
-        def _context_row_already_displayed(m):
+        def _is_displayed_native_image_context_row(m):
             return (
                 isinstance(m, dict)
                 and m.get('_active_turn_token') in _displayed_native_image_context_tokens
-            ) or _durable_tool_row_identity(m) in _display_durable_tool_rows
+            )
+
+        def _displayed_durable_tool_twin_identity(m):
+            _durable = _durable_tool_row_identity(m)
+            if _durable is None:
+                return None
+            return _display_identity_by_durable_tool_row.get(_durable)
 
         _context_id_set = {
             _message_identity(m)
             for m in previous_context
-            if not _context_row_already_displayed(m)
+            if not _is_displayed_native_image_context_row(m)
+            if _displayed_durable_tool_twin_identity(m) is None
             if not _is_context_compression_marker(m)
             and not _is_compressed_context_tool_result_summary_message(m)
         }
         _has_context_only_turns = bool(_context_id_set - _display_id_set)
         if _has_context_only_turns:
-            context_keys = [
-                None
-                if _context_row_already_displayed(m)
-                else _message_identity(m)
-                for m in previous_context
-            ]
+            context_keys = []
+            for m in previous_context:
+                if _is_displayed_native_image_context_row(m):
+                    context_keys.append(None)
+                    continue
+                _twin_identity = _displayed_durable_tool_twin_identity(m)
+                context_keys.append(
+                    _twin_identity if _twin_identity is not None else _message_identity(m)
+                )
             # Precompute display keys once; avoids repeated json.dumps calls inside
             # the inner any() loop (was O(D²·C) — see perf fix below).
             _display_keys = [_message_identity(m) for m in previous_display]
