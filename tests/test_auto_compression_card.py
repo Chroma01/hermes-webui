@@ -1264,3 +1264,70 @@ def test_preserved_task_list_rendering_does_not_mutate_history():
     assert "S.messages" not in preserved_helpers
     assert ".splice(" not in preserved_helpers
     assert "delete " not in preserved_helpers
+
+
+def test_agent_pruned_tool_summary_with_same_durable_row_does_not_backfill():
+    """Agent-side compression replaces old tool results in model context with a
+    one-line summary (agent/context_compressor.py) that carries no WebUI flag.
+    The context row keeps the display row's durable identity, so backfill must
+    not splice it in beside the full visible tool output."""
+    full_tool_output = '{"total_count": 203, "matches": ["' + ("x" * 4000) + '"]}'
+    agent_summary = "[search_files] content search for 'needle' in /tmp/project -> 203 matches"
+    durable = {"_row_id": 190285, "message_uid": "27610bca2d6e49d29e75b6eff7c18194"}
+    previous_display = [
+        {"role": "user", "content": "find the needle"},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "call_search"}]},
+        {"role": "tool", "tool_call_id": "call_search", "content": full_tool_output, **durable},
+        {"role": "assistant", "content": "Found it"},
+    ]
+    previous_context = [
+        {"role": "user", "content": "[CONTEXT COMPACTION] earlier turns summarized"},
+        {"role": "user", "content": "find the needle"},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "call_search"}]},
+        {"role": "tool", "tool_call_id": "call_search", "content": agent_summary, **durable},
+        {"role": "assistant", "content": "Found it"},
+        {"role": "user", "content": "context-only middle user turn"},
+    ]
+    result_messages = previous_context + [
+        {"role": "user", "content": "next question"},
+        {"role": "assistant", "content": "next answer"},
+    ]
+
+    merged = _merge_display_messages_after_agent_result(
+        previous_display,
+        previous_context,
+        result_messages,
+        "next question",
+    )
+
+    tool_rows = [msg for msg in merged if msg.get("role") == "tool"]
+    assert [msg["content"] for msg in tool_rows] == [full_tool_output]
+    # Backfill of genuinely context-only turns still works.
+    assert any(msg.get("content") == "context-only middle user turn" for msg in merged)
+
+
+def test_tool_rows_with_distinct_durable_rows_still_backfill():
+    """Different durable rows sharing a tool_call_id remain separate rows."""
+    previous_display = [
+        {"role": "user", "content": "run it"},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "call_a"}]},
+        {"role": "tool", "tool_call_id": "call_a", "content": "first output", "_row_id": 10},
+        {"role": "assistant", "content": "done"},
+    ]
+    previous_context = [
+        {"role": "user", "content": "run it"},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "call_a"}]},
+        {"role": "tool", "tool_call_id": "call_a", "content": "first output", "_row_id": 10},
+        {"role": "tool", "tool_call_id": "call_a", "content": "other output", "_row_id": 11},
+        {"role": "assistant", "content": "done"},
+    ]
+    result_messages = previous_context + [
+        {"role": "user", "content": "next"},
+        {"role": "assistant", "content": "ok"},
+    ]
+
+    merged = _merge_display_messages_after_agent_result(
+        previous_display, previous_context, result_messages, "next",
+    )
+
+    assert [m["content"] for m in merged if m.get("role") == "tool"] == ["first output", "other output"]

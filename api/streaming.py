@@ -7680,6 +7680,25 @@ def _message_identity(msg):
     )
 
 
+def _durable_tool_row_identity(msg):
+    """Return (tool_call_id, _row_id) for a tool row with a valid durable row.
+
+    Agent-side compression rewrites old tool results in model context to a
+    one-line summary while keeping the state.db row, so content-based identity
+    differs from the visible full-output row. A durable row ID proves row
+    identity (run-state contract), so backfill can match on it instead.
+    """
+    if not isinstance(msg, dict) or msg.get('role') != 'tool':
+        return None
+    row_id = msg.get('_row_id')
+    tool_call_id = msg.get('tool_call_id')
+    if isinstance(row_id, bool) or not isinstance(row_id, int) or row_id <= 0:
+        return None
+    if not isinstance(tool_call_id, str) or not tool_call_id:
+        return None
+    return (tool_call_id, row_id)
+
+
 def _messages_have_prefix(messages, prefix, *, key_fn=None):
     key_fn = key_fn or _message_identity
     if len(messages or []) < len(prefix or []):
@@ -8579,13 +8598,24 @@ def _merge_display_messages_after_agent_result(
             )
         )
         _display_id_set = {_message_identity(m) for m in previous_display}
+        # A context tool row whose durable row is already displayed is the same
+        # row (e.g. an Agent-pruned summary of the visible full output), never
+        # a context-only turn, regardless of how its content was rewritten.
+        _display_durable_tool_rows = {
+            _durable_tool_row_identity(m) for m in previous_display
+        }
+        _display_durable_tool_rows.discard(None)
+
+        def _context_row_already_displayed(m):
+            return (
+                isinstance(m, dict)
+                and m.get('_active_turn_token') in _displayed_native_image_context_tokens
+            ) or _durable_tool_row_identity(m) in _display_durable_tool_rows
+
         _context_id_set = {
             _message_identity(m)
             for m in previous_context
-            if not (
-                isinstance(m, dict)
-                and m.get('_active_turn_token') in _displayed_native_image_context_tokens
-            )
+            if not _context_row_already_displayed(m)
             if not _is_context_compression_marker(m)
             and not _is_compressed_context_tool_result_summary_message(m)
         }
@@ -8593,10 +8623,7 @@ def _merge_display_messages_after_agent_result(
         if _has_context_only_turns:
             context_keys = [
                 None
-                if (
-                    isinstance(m, dict)
-                    and m.get('_active_turn_token') in _displayed_native_image_context_tokens
-                )
+                if _context_row_already_displayed(m)
                 else _message_identity(m)
                 for m in previous_context
             ]
