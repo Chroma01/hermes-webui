@@ -2961,6 +2961,7 @@ from api.config import (
     create_stream_channel,
     publish_pre_admission_claim,
     retire_pre_admission_claim_if_owned,
+    is_orphaned_stream,
     get_config,
     get_webui_session_save_mode,
     get_config_snapshot,
@@ -24283,24 +24284,16 @@ def _active_stream_blocks_chat_start(session, stream_id: str | None) -> bool:
     orphan_released = False
     with STREAMS_LOCK:
         if stream_id in STREAMS:
-            try:
-                with ACTIVE_RUNS_LOCK:
-                    worker_alive = stream_id in (ACTIVE_RUNS or {})
-            except Exception:
-                # Fail closed: an unreadable liveness registry must not be
-                # mistaken for proof of an orphan.
-                return True
-            if worker_alive:
-                return True
-            if stream_id in PRE_ADMISSION_CLAIMS:
-                # The launch phase published its ownership claim on this same
-                # lock edge: the stream is registered but its worker has not been
-                # admitted yet. Keep it whatever the pending age -- a slow session
-                # save between registration and worker admission is not evidence
-                # of an orphan, and reaping it here makes the first worker exit
-                # without running its turn (#7302, maintainer finding 5).
-                return True
-            if _pending_turn_in_registration_window(session):
+            # ONE definition of "orphan", shared with every other reader
+            # (re-gate finding 2): registered, no live worker, no launch-phase
+            # claim, and no pending turn inside its registration window. The claim
+            # check is what keeps a stream that is still launching alive whatever
+            # the pending age (finding 5).
+            if not is_orphaned_stream(
+                stream_id,
+                pending_turn_in_window=_pending_turn_in_registration_window(session),
+                streams_lock_held=True,
+            ):
                 return True
             # Confirmed orphan. Clear the WHOLE stream-owned state, not just the
             # registry entry: a crashed or wedged worker never reaches its own

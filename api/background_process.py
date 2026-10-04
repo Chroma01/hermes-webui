@@ -725,6 +725,60 @@ def _reaper_loop() -> None:
                     for sid in collected:
                         _LAST_EMIT_TS.pop(sid, None)
                 logger.debug("SessionChannel reaper collected: %s", collected)
+
+            # Orphan streams (re-gate, greptile finding 2): a STREAMS entry whose
+            # worker died before running its teardown is never reclaimed by
+            # anything -- this loop only ever looked at SESSION_CHANNELS -- so it
+            # holds its stream-owned rows and keeps the session reporting busy
+            # (see _session_has_active_turn) for the life of the process. Reclaim
+            # it with the SAME orphan definition chat/start's guard uses, so there
+            # is one notion of "orphan" in the codebase.
+            #
+            # Lock order: snapshot ACTIVE_RUNS under ACTIVE_RUNS_LOCK BEFORE taking
+            # STREAMS_LOCK (the order _emit_to_session_streams documents) so the two
+            # independent locks are never nested. is_orphaned_stream() then
+            # re-validates, including the launch-phase claim -- without that check
+            # this sweep would reap a stream that is still launching and
+            # reintroduce finding 5 through the back door.
+            try:
+                from api import config as _cfg
+
+                with _cfg.ACTIVE_RUNS_LOCK:
+                    _active_runs_snapshot = dict(_cfg.ACTIVE_RUNS or {})
+                with _cfg.STREAMS_LOCK:
+                    _claimed = set((_cfg.PRE_ADMISSION_CLAIMS or {}).keys())
+                    _stream_candidates = [
+                        _sid
+                        for _sid in list((_cfg.STREAMS or {}).keys())
+                        if _sid not in _active_runs_snapshot and _sid not in _claimed
+                    ]
+            except Exception:
+                _stream_candidates = []
+                logger.debug("orphan-stream sweep snapshot failed", exc_info=True)
+            for _orphan_sid in _stream_candidates:
+                try:
+                    if not _cfg.is_orphaned_stream(_orphan_sid):
+                        continue
+                    _owner_sid = _cfg.stream_owner_session_id(_orphan_sid)
+                    _cfg.release_stream_owned_registries(
+                        _orphan_sid, session_id=_owner_sid
+                    )
+                    # Gateway-owned rows live in api/gateway_chat.py and must be
+                    # released outside STREAMS_LOCK, exactly as the guard does.
+                    from api.gateway_chat import release_gateway_stream_state
+
+                    release_gateway_stream_state(_orphan_sid)
+                    logger.info(
+                        "reaper reclaimed orphaned stream %s (no worker, no "
+                        "launch claim, no pending turn)",
+                        _orphan_sid,
+                    )
+                except Exception:
+                    logger.debug(
+                        "reaper failed to reclaim orphaned stream %s",
+                        _orphan_sid,
+                        exc_info=True,
+                    )
             # Sweep the per-session completion-dedup map by DELIVERY lifecycle,
             # not channel collection. ``BG_TASK_COMPLETE_EVENTS_SEEN`` gains a
             # ``session_id -> set[process_id]`` entry the first time a bg task
@@ -2054,7 +2108,16 @@ def _session_has_active_turn(session_id: str) -> bool:
         logger.debug("STREAMS active-turn check failed", exc_info=True)
         return False
     for _stream_id in live_stream_ids:
-        if str(stream_owners.get(_stream_id) or "") == str(session_id or ""):
+        if str(stream_owners.get(_stream_id) or "") != str(session_id or ""):
+            continue
+        # A stale entry is not a live turn. Counting STREAMS membership alone made
+        # an orphaned stream keep the session looking busy forever, so sibling
+        # async-delegation completions were refused against a stream with no
+        # worker (re-gate finding 2). Ask the shared orphan predicate instead.
+        # ``pending_turn_in_window`` stays False here: the launch-phase claim
+        # already covers the registration-to-admission gap, and an unclaimed,
+        # worker-less stream is exactly what the predicate is meant to catch.
+        if not _cfg.is_orphaned_stream(_stream_id):
             return True
     return False
 

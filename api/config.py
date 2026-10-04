@@ -11530,6 +11530,62 @@ def retire_pre_admission_claim_if_owned(
         return _retire()
 
 
+def is_orphaned_stream(
+    stream_id: str,
+    *,
+    pending_turn_in_window: bool = False,
+    streams_lock_held: bool = False,
+) -> bool:
+    """Single definition of an orphaned stream, shared by every reader.
+
+    A stream is an orphan only when ALL of these hold:
+
+      * it is still registered in ``STREAMS``;
+      * no worker owns it (``ACTIVE_RUNS`` has no row);
+      * it is not still launching (``PRE_ADMISSION_CLAIMS`` has no claim);
+      * its pending turn is outside the registration window
+        (``pending_turn_in_window`` -- the caller's call, since only callers with
+        the session at hand can evaluate it).
+
+    ``STREAMS`` membership alone is not liveness: the entry is removed by the
+    worker's own finalization, so a hard-killed or wedged worker leaves it behind.
+    ``ACTIVE_RUNS`` is the authoritative worker-liveness registry, the
+    launch-phase claim covers the window between registration and worker
+    admission, and the pending window covers the shortest gap for callers that
+    hold a session.
+
+    The claim check is mandatory. Without it a stream that is still launching is
+    classified as orphaned and reaped, which makes its first worker exit without
+    running the turn (finding 5). Callers that already hold ``STREAMS_LOCK`` must
+    pass ``streams_lock_held=True``: ``threading.Lock`` is not reentrant.
+    """
+    stream_id = str(stream_id or "").strip()
+    if not stream_id:
+        return False
+
+    def _decide() -> bool:
+        if stream_id not in STREAMS:
+            return False
+        if stream_id in PRE_ADMISSION_CLAIMS:
+            return False
+        if pending_turn_in_window:
+            return False
+        try:
+            with ACTIVE_RUNS_LOCK:
+                if stream_id in (ACTIVE_RUNS or {}):
+                    return False
+        except Exception:
+            # Fail closed: an unreadable liveness registry must never be taken as
+            # proof of an orphan.
+            return False
+        return True
+
+    if streams_lock_held:
+        return _decide()
+    with STREAMS_LOCK:
+        return _decide()
+
+
 def register_stream_owner(stream_id: str, session_id: str) -> None:
     """Record the session that owns a stream before worker startup."""
     stream_id = str(stream_id or "").strip()
