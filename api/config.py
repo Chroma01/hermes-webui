@@ -11530,6 +11530,32 @@ def retire_pre_admission_claim_if_owned(
         return _retire()
 
 
+def _is_orphaned_stream_locked(
+    stream_id: str, pending_turn_in_window: bool
+) -> bool:
+    """Orphan decision body. The caller holds ``STREAMS_LOCK``.
+
+    Split out so the decision and the release can share ONE lock acquisition
+    (``release_orphaned_stream_if_still_orphaned``); ``is_orphaned_stream`` is the
+    locking wrapper for readers that only need the answer.
+    """
+    if stream_id not in STREAMS:
+        return False
+    if stream_id in PRE_ADMISSION_CLAIMS:
+        return False
+    if pending_turn_in_window:
+        return False
+    try:
+        with ACTIVE_RUNS_LOCK:
+            if stream_id in (ACTIVE_RUNS or {}):
+                return False
+    except Exception:
+        # Fail closed: an unreadable liveness registry must never be taken as
+        # proof of an orphan.
+        return False
+    return True
+
+
 def is_orphaned_stream(
     stream_id: str,
     *,
@@ -11558,32 +11584,47 @@ def is_orphaned_stream(
     classified as orphaned and reaped, which makes its first worker exit without
     running the turn (finding 5). Callers that already hold ``STREAMS_LOCK`` must
     pass ``streams_lock_held=True``: ``threading.Lock`` is not reentrant.
+
+    Reading this answer and acting on it later is NOT safe on its own -- see
+    ``release_orphaned_stream_if_still_orphaned`` for the decide-and-release
+    contract.
     """
     stream_id = str(stream_id or "").strip()
     if not stream_id:
         return False
-
-    def _decide() -> bool:
-        if stream_id not in STREAMS:
-            return False
-        if stream_id in PRE_ADMISSION_CLAIMS:
-            return False
-        if pending_turn_in_window:
-            return False
-        try:
-            with ACTIVE_RUNS_LOCK:
-                if stream_id in (ACTIVE_RUNS or {}):
-                    return False
-        except Exception:
-            # Fail closed: an unreadable liveness registry must never be taken as
-            # proof of an orphan.
-            return False
-        return True
-
     if streams_lock_held:
-        return _decide()
+        return _is_orphaned_stream_locked(stream_id, pending_turn_in_window)
     with STREAMS_LOCK:
-        return _decide()
+        return _is_orphaned_stream_locked(stream_id, pending_turn_in_window)
+
+
+def release_orphaned_stream_if_still_orphaned(
+    stream_id: str, *, pending_turn_in_window: bool = False
+) -> bool:
+    """Decide AND release on ONE ``STREAMS_LOCK`` edge. Returns whether it released.
+
+    Callers that decide and release under two separate acquisitions hand the worker
+    a race: it can publish its ``ACTIVE_RUNS`` row (or its launch claim) in the gap,
+    and the release then drops a stream that is live -- taking its ownership state
+    with it while the worker keeps running. Re-validating inside the same critical
+    section that drops the rows makes a stale decision impossible.
+
+    ``_release_stream_owned_rows`` takes no locks ("caller holds the locks"), and
+    ``stream_owner_session_id`` only takes ``STREAM_SESSION_OWNERS_LOCK``, which
+    respects the documented ``STREAMS_LOCK -> STREAM_SESSION_OWNERS_LOCK`` order.
+
+    Gateway-owned rows are deliberately NOT touched here: they live in
+    api/gateway_chat.py and must be released OUTSIDE ``STREAMS_LOCK``, so the caller
+    runs ``release_gateway_stream_state()`` when this returns True.
+    """
+    stream_id = str(stream_id or "").strip()
+    if not stream_id:
+        return False
+    with STREAMS_LOCK:
+        if not _is_orphaned_stream_locked(stream_id, pending_turn_in_window):
+            return False
+        _release_stream_owned_rows(stream_id, stream_owner_session_id(stream_id))
+        return True
 
 
 def register_stream_owner(stream_id: str, session_id: str) -> None:

@@ -56,6 +56,11 @@ _REQUIRES_ORPHAN_HELPER = pytest.mark.skipif(
     reason="shared orphan predicate not present (pre-fix RED)",
 )
 
+_REQUIRES_RELEASE_HELPER = pytest.mark.skipif(
+    not hasattr(config, "release_orphaned_stream_if_still_orphaned"),
+    reason="decide-and-release helper not present (pre-fix RED)",
+)
+
 
 def _register_worker_less_stream():
     """Register a stream with an owner and nothing else: the orphan shape."""
@@ -154,3 +159,89 @@ def test_the_shared_predicate_covers_every_liveness_signal():
     # An unregistered stream is never an orphan.
     config.release_stream_owned_registries(STREAM_ID)
     assert config.is_orphaned_stream(STREAM_ID) is False
+
+
+# ---------------------------------------------------------------------------
+# Deciding and releasing must be ONE lock edge (re-gate finding A)
+# ---------------------------------------------------------------------------
+
+
+def test_a_stream_that_became_live_after_the_sweep_snapshot_survives():
+    """The race greptile reported: a candidate becomes live before it is dropped.
+
+    The sweep decided orphanhood under one ``STREAMS_LOCK`` acquisition and released
+    under the next, so a worker that admitted its stream -- or a launch that
+    published its claim -- in that gap had a LIVE stream deleted, ownership rows
+    included, while the worker kept running. The release must re-validate inside the
+    same critical section that drops the rows.
+    """
+    _register_worker_less_stream()
+
+    release_if_orphan = getattr(
+        config, "release_orphaned_stream_if_still_orphaned", None
+    )
+    if release_if_orphan is None:
+        # Pre-fix shape: the caller's decision is taken here, and the rows go under
+        # a SEPARATE acquisition further down.
+        assert config.is_orphaned_stream(STREAM_ID) is True
+
+    # The worker is admitted in that gap (a launch claim landing would be the same
+    # shape, and is covered by the predicate test above).
+    config.register_active_run(
+        STREAM_ID, session_id=SESSION_ID, started_at=time.time(), phase="starting"
+    )
+
+    if release_if_orphan is not None:
+        assert release_if_orphan(STREAM_ID) is False, (
+            "the release re-validated inside its own acquisition, so a stream that "
+            "became live after the caller's snapshot must not be released"
+        )
+    else:
+        config.release_stream_owned_registries(STREAM_ID)
+
+    assert STREAM_ID in config.STREAMS, (
+        "a stream that became live after the sweep's snapshot was released: its "
+        "worker keeps running with no stream and no ownership rows"
+    )
+    assert STREAM_ID in config.ACTIVE_RUNS, (
+        "the live worker's own row was dropped along with the stream"
+    )
+    assert config.stream_owner_session_id(STREAM_ID) == SESSION_ID, (
+        "the live stream lost its owner entry"
+    )
+
+
+@_REQUIRES_RELEASE_HELPER
+def test_the_release_helper_refuses_a_stream_with_a_launch_claim():
+    """A launching stream is not an orphan: the helper must leave it alone."""
+    _register_worker_less_stream()
+    config.publish_pre_admission_claim(STREAM_ID)
+
+    assert config.release_orphaned_stream_if_still_orphaned(STREAM_ID) is False
+    assert STREAM_ID in config.STREAMS
+    assert STREAM_ID in config.PRE_ADMISSION_CLAIMS
+
+
+@_REQUIRES_RELEASE_HELPER
+def test_the_release_helper_refuses_a_stream_with_a_live_worker():
+    """A running stream is not an orphan either."""
+    _register_worker_less_stream()
+    config.register_active_run(
+        STREAM_ID, session_id=SESSION_ID, started_at=time.time(), phase="starting"
+    )
+
+    assert config.release_orphaned_stream_if_still_orphaned(STREAM_ID) is False
+    assert STREAM_ID in config.STREAMS
+    assert STREAM_ID in config.ACTIVE_RUNS
+
+
+@_REQUIRES_RELEASE_HELPER
+def test_the_release_helper_releases_a_true_orphan():
+    """Contrast: nothing owns it, nothing is launching it -- it goes, and says so."""
+    _register_worker_less_stream()
+
+    assert config.release_orphaned_stream_if_still_orphaned(STREAM_ID) is True
+    assert STREAM_ID not in config.STREAMS
+    assert config.stream_owner_session_id(STREAM_ID) is None
+    # Idempotent: a second call has nothing left to release.
+    assert config.release_orphaned_stream_if_still_orphaned(STREAM_ID) is False

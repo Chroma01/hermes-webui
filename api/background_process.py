@@ -819,12 +819,13 @@ def _reaper_loop() -> None:
                 logger.debug("orphan-stream sweep snapshot failed", exc_info=True)
             for _orphan_sid in _stream_candidates:
                 try:
-                    if not _cfg.is_orphaned_stream(_orphan_sid):
+                    # Decide AND release on ONE STREAMS_LOCK edge (re-gate finding A):
+                    # deciding here and releasing in a separate acquisition let a
+                    # worker publish its ACTIVE_RUNS row (or its launch claim) in the
+                    # gap, and the release then dropped a stream that was live. The
+                    # candidate list above is only a prefiltro.
+                    if not _cfg.release_orphaned_stream_if_still_orphaned(_orphan_sid):
                         continue
-                    _owner_sid = _cfg.stream_owner_session_id(_orphan_sid)
-                    _cfg.release_stream_owned_registries(
-                        _orphan_sid, session_id=_owner_sid
-                    )
                     # Gateway-owned rows live in api/gateway_chat.py and must be
                     # released outside STREAMS_LOCK, exactly as the guard does.
                     from api.gateway_chat import release_gateway_stream_state
