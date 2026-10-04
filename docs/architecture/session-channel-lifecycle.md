@@ -28,7 +28,10 @@ tuple), so a rebound registry is never leaked by a teardown holding the old obje
 ## Launch phase: registration → admission
 
 1. **Register.** Create the channel, `register_stream_owner()`, and inside ONE `STREAMS_LOCK`
-   critical section publish `STREAMS[stream_id]` **and** `publish_pre_admission_claim()`.
+   critical section publish `STREAMS[stream_id]` **and** `publish_pre_admission_claim()` — on
+   **every** launch edge: ordinary start, regeneration, `/btw` and `/api/background`. All four are
+   load-bearing since the reaper sweeps orphans (a claimed stream whose worker has not been
+   admitted yet is launching, not dead).
 2. **Launch.** The worker is scheduled but not yet admitted. The regeneration path holds it at
    `release_worker.wait()` while `s.save()` runs, so this window is unbounded in practice.
 3. **Admit.** The worker registers in `ACTIVE_RUNS` and retires the claim **on the same lock
@@ -43,9 +46,10 @@ tuple), so a rebound registry is never leaked by a teardown holding the old obje
 
 - no subscribers, and `last_subscriber_drop_at` is older than
   `SESSION_CHANNEL_SUBSCRIBER_GRACE_SECS` (60 s) — normal teardown;
-- the channel has outlived `SESSION_CHANNEL_IDLE_TTL_SECS` (14400 s) — zombie cap; the browser's
-  EventSource reconnects after EOF and pending `process_complete` events are recovered by the
-  frontend's polling/self-heal;
+- **no subscribers** AND the channel has outlived `SESSION_CHANNEL_IDLE_TTL_SECS` (14400 s) — a
+  hard lifetime cap that also sweeps a channel whose subscribers oscillated. With a subscriber
+  attached the only admissible evidence is the dead-subscriber signal below: **age alone never
+  collects a channel that still has one**;
 - **every** attached subscriber is dead, where a subscriber is dead when EITHER
   - its queue rejected broadcasts (`queue.Full`) continuously for
     `SESSION_CHANNEL_SUBSCRIBER_STALL_SECS` (300 s) — cleared as soon as the queue has capacity
@@ -76,8 +80,10 @@ closed if that registry cannot be read); no `PRE_ADMISSION_CLAIMS` entry; and th
 - `_active_stream_blocks_chat_start` — keeps a non-orphan; a confirmed orphan is cleared from the
   whole stream-owned set so the next `chat/start` is admitted.
 - `_session_has_active_turn` — an orphaned stream must not keep reporting the session as busy.
-- `_reaper_loop` — reclaims orphaned streams through the same canonical teardown, plus
-  `release_gateway_stream_state()`.
+- `_reaper_loop` — reclaims orphaned streams through **`release_orphaned_stream_if_still_orphaned()`**,
+  which re-decides *and* releases on one `STREAMS_LOCK` edge (a decision followed by a separate
+  release would let a worker admit itself in the gap and lose a live stream), plus
+  `release_gateway_stream_state()` outside the lock.
 
 The claim check is mandatory. Without it a stream that is still launching is classified as
 orphaned and reaped, and its first worker exits without running its turn (#7302, maintainer
@@ -98,11 +104,12 @@ finding 5).
 | # | Invariant | Enforced in | Pinned by |
 |---|---|---|---|
 | I1 | A registered stream whose launch-phase claim is not retired keeps blocking `chat/start`, whatever the pending age. | `_active_stream_blocks_chat_start` | `tests/test_7302_pre_admission_claim_barrier.py` |
-| I2 | The claim is published in the same critical section as the `STREAMS` entry and retired by identity at admission, Stop, launch failure, and the canonical teardown. | `api/config.py`, launch sites, `cancel_stream` | same file |
+| I2 | The claim is published in the same critical section as the `STREAMS` entry **on every launch edge** (ordinary start, regeneration, `/btw`, background), and retired by identity at admission, Stop, launch failure, and the canonical teardown. | `api/config.py`, all four launch sites, `cancel_stream` | `tests/test_7302_pre_admission_claim_barrier.py` |
 | I3 | A stream is an orphan under exactly one definition, and the launch claim is part of it. | `is_orphaned_stream()` | `tests/test_7302_orphan_stream_predicate.py` |
 | I4 | A healthy idle subscriber can never be collected: it proves itself on every keepalive. | writer-liveness signal | `tests/test_7302_writer_liveness.py` (negative control) |
 | I5 | A subscriber that just proved liveness is never closed by a decision taken on stale state. | revalidation under the channel lock | same file |
 | I6 | Only the exact stream id is cleared, and the whole stream-owned set goes together. | `release_stream_owned_registries()` | `tests/test_reaper_drain_progress.py`, `tests/test_session_channel_explicit_close.py` |
+| I7 | An orphan is reaped only while it is still an orphan: the decision and the release share one `STREAMS_LOCK` edge. | `release_orphaned_stream_if_still_orphaned()` | `tests/test_7302_orphan_stream_predicate.py` |
 
 ## What not to do
 
