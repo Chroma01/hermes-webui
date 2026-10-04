@@ -224,11 +224,22 @@ def test_reconnect_lands_on_a_fresh_channel_after_close():
 
     second = bp.get_or_create_session_channel(sid)
 
-    assert second is not first
-    assert second.closed is False
-    q_new = second.subscribe()
-    assert second.emit("bg_task_complete", {"after": "reconnect"}) == 1
-    assert q_new.get_nowait() == ("bg_task_complete", {"after": "reconnect"})
+    q_new = None
+    try:
+        assert second is not first
+        assert second.closed is False
+        q_new = second.subscribe()
+        assert second.emit("bg_task_complete", {"after": "reconnect"}) == 1
+        assert q_new.get_nowait() == ("bg_task_complete", {"after": "reconnect"})
+    finally:
+        # Leave no live channel behind. An entry whose subscriber is neither
+        # drained nor stalled reports ``reaper_should_collect() is False``, so the
+        # reaper can never reclaim it: it would leak into every later test in the
+        # session and make them order-dependent (re-gate finding 4).
+        if q_new is not None:
+            second.unsubscribe(q_new)
+        with bp.SESSION_CHANNELS_LOCK:
+            bp.SESSION_CHANNELS.pop(sid, None)
 
 
 def test_handler_loop_contract_sentinel_exits_and_unsubscribes():
