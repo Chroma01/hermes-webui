@@ -10612,6 +10612,12 @@ def _run_agent_streaming(
                     ephemeral=bool(ephemeral),
                     backend=WEBUI_LOCAL_CHAT_BACKEND,
                 )
+                # Worker admission ends the launch phase (#7302 finding 5): retire
+                # the claim published at registration. Ownership lives in
+                # ACTIVE_RUNS from here on.
+                from api.config import retire_pre_admission_claim_if_owned
+
+                retire_pre_admission_claim_if_owned(stream_id, streams_lock_held=True)
     if q is None:
         # The stream was cancelled (or cleared as an orphan) before this worker
         # was admitted, so no teardown finally will ever run for it: release
@@ -15590,6 +15596,13 @@ def cancel_stream(stream_id: str) -> bool:
         # _clear_stale_stream_state() can eventually reclaim the session if the
         # worker is stuck in C-level I/O and never reaches its finally (#6623).
         update_active_run(stream_id, phase="cancelling", cancelled_at=time.time())
+
+        # Stop also ends the launch phase when the worker was never admitted: retire
+        # the claim on this same edge, AFTER the cancellation is published and BEFORE
+        # ownership is detached (#7302 finding 5). Retiring earlier would let a second
+        # chat/start slip in over a turn Stop already cancelled; retiring later leaves
+        # the claim behind, which would block a reuse of this stream id.
+        _live_config.retire_pre_admission_claim_if_owned(stream_id, streams_lock_held=True)
 
         # Stop and Steer share STREAMS_LOCK -> ACTIVE_RUNS_LOCK ordering.
         # Publish cancellation and detach ownership before releasing the edge;

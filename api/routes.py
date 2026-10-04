@@ -2924,6 +2924,7 @@ from api.config import (
     LOCK,
     STREAMS,
     STREAMS_LOCK,
+    PRE_ADMISSION_CLAIMS,
     CANCEL_FLAGS,
     STREAM_LAST_EVENT_ID,
     SERVER_START_TIME,
@@ -2958,6 +2959,8 @@ from api.config import (
     set_reasoning_display,
     set_reasoning_effort,
     create_stream_channel,
+    publish_pre_admission_claim,
+    retire_pre_admission_claim_if_owned,
     get_config,
     get_webui_session_save_mode,
     get_config_snapshot,
@@ -24283,6 +24286,14 @@ def _active_stream_blocks_chat_start(session, stream_id: str | None) -> bool:
                 return True
             if worker_alive:
                 return True
+            if stream_id in PRE_ADMISSION_CLAIMS:
+                # The launch phase published its ownership claim on this same
+                # lock edge: the stream is registered but its worker has not been
+                # admitted yet. Keep it whatever the pending age -- a slow session
+                # save between registration and worker admission is not evidence
+                # of an orphan, and reaping it here makes the first worker exit
+                # without running its turn (#7302, maintainer finding 5).
+                return True
             if _pending_turn_in_registration_window(session):
                 return True
             # Confirmed orphan. Clear the WHOLE stream-owned state, not just the
@@ -24449,6 +24460,9 @@ def _start_regeneration_stream_locked(
             STREAM_GOAL_RELATED.pop(stream_id, None)
         with STREAMS_LOCK:
             STREAMS.pop(stream_id, None)
+            # Launch failure ends the launch phase: the claim must not outlive the
+            # registration it was published for (#7302 finding 5).
+            retire_pre_admission_claim_if_owned(stream_id, streams_lock_held=True)
         unregister_stream_owner(stream_id)
         clear_session_writeback_owner_if_owned(s.session_id, stream_id)
         if gateway_starting:
@@ -24520,6 +24534,11 @@ def _start_regeneration_stream_locked(
         register_stream_owner(stream_id, s.session_id)
         with STREAMS_LOCK:
             STREAMS[stream_id] = stream
+            # Launch-phase ownership claim (#7302 finding 5): published atomically
+            # with the registration so the orphan check keeps this stream while its
+            # worker is still being admitted -- this path holds that worker at
+            # release_worker.wait() while s.save() runs below.
+            publish_pre_admission_claim(stream_id, streams_lock_held=True)
         if goal_related:
             STREAM_GOAL_RELATED[stream_id] = True
         if backend_is_gateway:
@@ -24941,6 +24960,10 @@ def _start_chat_stream_for_session(
                     register_stream_owner(stream_id, s.session_id)
                     with STREAMS_LOCK:
                         STREAMS[stream_id] = stream
+                        # Same launch-phase claim as the regeneration path
+                        # (#7302 finding 5): the ordinary start has the same
+                        # registration-then-worker-admission window.
+                        publish_pre_admission_claim(stream_id, streams_lock_held=True)
                     # #1932: mark stream as goal-related so the streaming hook evaluates the goal.
                     if goal_related:
                         STREAM_GOAL_RELATED[stream_id] = True

@@ -11370,6 +11370,13 @@ def create_stream_channel() -> StreamChannel:
 
 STREAMS: dict = {}
 STREAMS_LOCK = threading.Lock()
+# Launch-phase ownership claims, keyed by stream_id and guarded by STREAMS_LOCK
+# (no extra lock edge). A claim is published in the SAME critical section that
+# creates the STREAMS entry and retired by identity once the worker is admitted
+# or the stream is torn down. While it exists the stream is still launching, so
+# chat/start must keep it whatever the pending age -- a slow session save between
+# registration and worker admission is not evidence of an orphan.
+PRE_ADMISSION_CLAIMS: dict = {}
 
 
 def peek_stream(stream_id):
@@ -11428,6 +11435,10 @@ def _release_stream_owned_rows(stream_id: str, session_id: str | None) -> None:
     """Drop this stream's rows from every registry. Caller holds the locks."""
     for _registry in stream_owned_registries():
         _registry.pop(stream_id, None)
+    # The launch-phase claim dies with the stream it was published for. This is
+    # the single teardown entry point every release path goes through, so the
+    # claim can never outlive its stream and block a later chat/start.
+    PRE_ADMISSION_CLAIMS.pop(stream_id, None)
     # Owner registries. The writeback entry is compare-and-clear: a successor
     # admitted after cancel must keep its registry claim (#6623 re-gate).
     unregister_stream_owner(stream_id)
@@ -11465,6 +11476,58 @@ def release_stream_owned_registries(
         return
     with STREAMS_LOCK:
         _release_stream_owned_rows(stream_id, session_id)
+
+
+def publish_pre_admission_claim(stream_id: str, *, streams_lock_held: bool = False) -> str:
+    """Publish the launch-phase ownership claim for a stream being registered.
+
+    MUST run inside the same ``STREAMS_LOCK`` critical section that creates the
+    ``STREAMS`` entry (pass ``streams_lock_held=True``; ``threading.Lock`` is not
+    reentrant): the orphan check in ``_active_stream_blocks_chat_start`` reads this
+    registry under that lock, and a stream registered without its claim is
+    indistinguishable from a crashed turn once the pending window expires.
+
+    Returns the claim token; retire with ``retire_pre_admission_claim_if_owned``.
+    """
+    stream_id = str(stream_id or "").strip()
+    if not stream_id:
+        return ""
+    claim_token = uuid.uuid4().hex
+    if streams_lock_held:
+        PRE_ADMISSION_CLAIMS[stream_id] = claim_token
+        return claim_token
+    with STREAMS_LOCK:
+        PRE_ADMISSION_CLAIMS[stream_id] = claim_token
+    return claim_token
+
+
+def retire_pre_admission_claim_if_owned(
+    stream_id: str, *, claim_token: str | None = None, streams_lock_held: bool = False
+) -> bool:
+    """Retire a launch-phase claim by IDENTITY. Idempotent; returns whether it retired.
+
+    ``claim_token=None`` is the stream's own teardown speaking for the whole
+    stream (Stop, launch failure, worker admission): the claim goes with it. With
+    a token, only that exact claim is retired, so a successor that registered the
+    same stream id keeps its own claim.
+    """
+    stream_id = str(stream_id or "").strip()
+    if not stream_id:
+        return False
+
+    def _retire() -> bool:
+        current = PRE_ADMISSION_CLAIMS.get(stream_id)
+        if current is None:
+            return False
+        if claim_token is not None and current != claim_token:
+            return False
+        PRE_ADMISSION_CLAIMS.pop(stream_id, None)
+        return True
+
+    if streams_lock_held:
+        return _retire()
+    with STREAMS_LOCK:
+        return _retire()
 
 
 def register_stream_owner(stream_id: str, session_id: str) -> None:
