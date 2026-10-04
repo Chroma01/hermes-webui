@@ -24155,6 +24155,12 @@ def _cleanup_chat_start_launch_failure(
         unregister_stream_owner(stream_id)
         with STREAMS_LOCK:
             STREAMS.pop(stream_id, None)
+            # A launch whose worker never started must not strand its launch-phase
+            # claim: this path clears the registries directly and never reaches the
+            # canonical release funnel, and the orphan check keeps a claimed stream
+            # alive whatever the pending age -- so a stale claim would block every
+            # later chat/start for this stream id (re-gate finding 3).
+            retire_pre_admission_claim_if_owned(stream_id, streams_lock_held=True)
         STREAM_GOAL_RELATED.pop(stream_id, None)
     except Exception:
         logger.debug(

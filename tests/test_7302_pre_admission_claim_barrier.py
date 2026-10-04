@@ -202,6 +202,74 @@ def test_the_canonical_teardown_retires_the_claim():
     )
 
 
+class _ExplodingThread:
+    """Constructs fine (like the real thread object) and fails on ``start()``."""
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def start(self):
+        raise RuntimeError("can't start new thread")
+
+
+@_REQUIRES_CLAIM_API
+def test_a_failed_launch_retires_its_claim_and_does_not_lock_the_stream(monkeypatch):
+    """A launch whose worker thread never starts must not strand its claim.
+
+    ``_cleanup_chat_start_launch_failure()`` clears the stream registries directly and
+    never goes through the canonical release funnel, so the launch-phase claim has to
+    be retired there too. A stranded claim keeps the orphan check blocking that stream
+    id whatever the pending age -- a permanent lockout for the session, not just a
+    leaked entry (re-gate finding 3).
+    """
+    import types as _types
+
+    import api.session_ops as session_ops
+    import api.turn_journal as turn_journal
+
+    monkeypatch.setattr(routes.threading, "Thread", _ExplodingThread)
+    monkeypatch.setattr(
+        routes.uuid, "uuid4", lambda: _types.SimpleNamespace(hex=STREAM_ID)
+    )
+    monkeypatch.setattr(
+        routes, "_prepare_chat_start_session_for_stream", lambda *a, **k: None
+    )
+    monkeypatch.setattr(session_ops, "snapshot_session_state", lambda s: {})
+    monkeypatch.setattr(session_ops, "restore_session_state", lambda *a, **k: None)
+    monkeypatch.setattr(turn_journal, "append_turn_journal_event", lambda *a, **k: {})
+    monkeypatch.setattr(routes, "set_last_workspace", lambda *a, **k: None)
+    monkeypatch.setattr(routes, "webui_gateway_chat_enabled", lambda cfg: False)
+    monkeypatch.setattr(routes, "_get_session_agent_lock", lambda sid: threading.Lock())
+
+    session = _LaunchSession(
+        pending_age_seconds=_REPAIR_STALE_PENDING_GRACE_SECONDS + 5
+    )
+    monkeypatch.setattr(routes, "get_session", lambda sid: session)
+
+    with pytest.raises(RuntimeError):
+        routes._start_chat_stream_for_session(
+            session,
+            msg="hello",
+            attachments=[],
+            workspace="test-workspace",
+            model="test-model",
+            model_provider="test-provider",
+            external_runtime_owned=False,
+        )
+
+    assert STREAM_ID not in config.STREAMS, (
+        "the failed launch left its stream registered"
+    )
+    assert STREAM_ID not in config.PRE_ADMISSION_CLAIMS, (
+        "the failed launch stranded its launch-phase claim: the orphan check keeps a "
+        "claimed stream alive whatever the pending age, so this stream id is locked "
+        "out for the life of the process"
+    )
+    assert routes._active_stream_blocks_chat_start(session, STREAM_ID) is False, (
+        "a chat/start is still blocked by a stream whose worker never started"
+    )
+
+
 class _GatedThread:
     """Stands in for ``threading.Thread``: records the launch, never runs the body.
 
