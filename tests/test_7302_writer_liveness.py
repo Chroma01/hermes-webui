@@ -141,3 +141,29 @@ def test_the_write_mark_tracks_only_attached_subscribers():
         "a detached queue kept a writer-liveness mark: the map would grow one "
         "entry per subscriber that ever attached"
     )
+
+
+def test_the_mirrored_keepalive_constant_stays_inside_the_staleness_window():
+    """A mirrored constant cannot check itself — this pins the coupling.
+
+    ``SESSION_CHANNEL_KEEPALIVE_SECS`` (api/background_process.py) mirrors the SSE
+    handler's real heartbeat interval (``_SSE_HEARTBEAT_INTERVAL_SECONDS`` in
+    api/routes.py) as a plain number, because ``routes`` imports this module and
+    importing back would be circular. If the real interval ever reached the
+    writer-staleness window, a quiet HEALTHY tab would stop proving itself in time
+    and the reaper would close a live connection — the failure the writer-liveness
+    signal exists to avoid, inverted.
+    """
+    routes = pytest.importorskip("api.routes")
+    real = float(routes._SSE_HEARTBEAT_INTERVAL_SECONDS)
+    mirrored = float(bp.SESSION_CHANNEL_KEEPALIVE_SECS)
+    stale_after = _writer_stale_after()
+
+    assert real < stale_after, (
+        f"the real keepalive interval ({real}s) is at or past the writer-staleness "
+        f"window ({stale_after}s): a healthy idle subscriber would be collected"
+    )
+    assert mirrored == real, (
+        f"SESSION_CHANNEL_KEEPALIVE_SECS ({mirrored}s) no longer matches the SSE "
+        f"handler's interval ({real}s): update the mirror with the handler"
+    )
