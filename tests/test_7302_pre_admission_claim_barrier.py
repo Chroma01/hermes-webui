@@ -25,6 +25,7 @@ and must STILL block while the launch phase is in flight.
 
 Grep for the assertions, not for source strings: nothing here reads the source text.
 """
+import io
 import threading
 import time
 
@@ -267,6 +268,137 @@ def test_a_failed_launch_retires_its_claim_and_does_not_lock_the_stream(monkeypa
     )
     assert routes._active_stream_blocks_chat_start(session, STREAM_ID) is False, (
         "a chat/start is still blocked by a stream whose worker never started"
+    )
+
+
+class _RecordingHandler:
+    """Minimal HTTP handler stub: the launch routes only write a JSON body."""
+
+    def __init__(self):
+        self.wfile = io.BytesIO()
+        self.headers = {}
+
+    def send_response(self, *args, **kwargs):
+        pass
+
+    def send_header(self, *args, **kwargs):
+        pass
+
+    def end_headers(self, *args, **kwargs):
+        pass
+
+    def close_connection(self):
+        pass
+
+
+def _drive_reaper_until(predicate, timeout: float = 0.6, interval: float = 0.02):
+    """Run the REAL ``_reaper_loop`` in a thread until ``predicate()`` holds."""
+    from api import background_process as bp
+
+    original = bp._REAPER_INTERVAL_SECS
+    bp._REAPER_INTERVAL_SECS = interval
+    bp.start_session_channel_reaper()
+    deadline = time.time() + timeout
+    try:
+        while time.time() < deadline:
+            if predicate():
+                return True
+            time.sleep(interval)
+        return predicate()
+    finally:
+        bp.stop_session_channel_reaper()
+        bp._REAPER_INTERVAL_SECS = original
+
+
+def _stub_launch_route(monkeypatch, *, session):
+    """Wire the common collaborators of the ``/btw`` and ``/background`` routes."""
+    import types as _types
+
+    import api.background as background
+    import api.models as models
+
+    _GatedThread.launched = []
+    # Replace routes' VIEW of the threading module, NOT the module itself: patching
+    # ``routes.threading.Thread`` mutates the shared module object, which also stubs
+    # the reaper's own thread inside api.background_process -- and then the sweep
+    # under test never runs (and stop_session_channel_reaper trips on a stub with no
+    # is_alive()).
+    monkeypatch.setattr(
+        routes,
+        "threading",
+        _types.SimpleNamespace(
+            Thread=_GatedThread, Lock=threading.Lock, Event=threading.Event
+        ),
+    )
+    monkeypatch.setattr(
+        routes.uuid, "uuid4", lambda: _types.SimpleNamespace(hex=STREAM_ID)
+    )
+    monkeypatch.setattr(routes, "_agent_runtime_barrier_response", lambda **k: None)
+    monkeypatch.setattr(routes, "_session_is_subagent_view_only", lambda sid: False)
+    monkeypatch.setattr(routes, "get_session", lambda sid: session)
+    # The hidden session is created server-side; keep it in memory.
+    monkeypatch.setattr(
+        models, "new_session", lambda **kwargs: _LaunchSession(pending_age_seconds=5)
+    )
+    monkeypatch.setattr(background, "track_btw", lambda *a, **k: None)
+    monkeypatch.setattr(background, "track_background", lambda *a, **k: None)
+    return background
+
+
+def test_the_btw_launch_publishes_a_claim_the_sweep_must_respect(monkeypatch):
+    """``/btw`` registers a stream whose worker has only been scheduled.
+
+    That window -- registered stream, no ``ACTIVE_RUNS`` row -- is exactly what the
+    reaper's sweep hunts for. Before this fix ``/btw`` published no launch-phase
+    claim, so the sweep harvested the stream and the worker started with nothing to
+    run: the claim went from decorative-for-chat/start to load-bearing (finding B).
+    """
+    session = _LaunchSession(pending_age_seconds=5)
+    _stub_launch_route(monkeypatch, session=session)
+
+    routes._handle_btw(
+        _RecordingHandler(), {"session_id": SESSION_ID, "question": "what time is it"}
+    )
+
+    assert STREAM_ID in config.STREAMS, "the /btw launch did not register its stream"
+    assert len(_GatedThread.launched) == 1, "the /btw launch never scheduled its worker"
+    assert STREAM_ID in config.PRE_ADMISSION_CLAIMS, (
+        "the /btw launch registered a stream with no launch-phase claim: the reaper's "
+        "sweep classifies it as dead and harvests it before the worker runs the task"
+    )
+
+    harvested = _drive_reaper_until(lambda: STREAM_ID not in config.STREAMS)
+    assert harvested is False, (
+        "the sweep harvested a /btw stream that was still launching"
+    )
+    assert STREAM_ID in config.STREAMS
+
+
+def test_the_background_launch_publishes_a_claim_the_sweep_must_respect(monkeypatch):
+    """``/api/background`` has the same registration-then-admission window."""
+    session = _LaunchSession(pending_age_seconds=5)
+    background = _stub_launch_route(monkeypatch, session=session)
+    monkeypatch.setattr(background, "complete_background", lambda *a, **k: None)
+
+    import api.session_ops as session_ops
+
+    monkeypatch.setattr(session_ops, "snapshot_session_state", lambda s: {})
+
+    routes._handle_background(
+        _RecordingHandler(), {"session_id": SESSION_ID, "prompt": "summarise this"}
+    )
+
+    assert STREAM_ID in config.STREAMS, (
+        "the background launch did not register its stream"
+    )
+    assert STREAM_ID in config.PRE_ADMISSION_CLAIMS, (
+        "the background launch registered a stream with no launch-phase claim: the "
+        "sweep harvests it and the worker starts with nothing to run"
+    )
+
+    harvested = _drive_reaper_until(lambda: STREAM_ID not in config.STREAMS)
+    assert harvested is False, (
+        "the sweep harvested a background stream that was still launching"
     )
 
 

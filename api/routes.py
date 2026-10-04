@@ -23617,6 +23617,12 @@ def _handle_btw(handler, body):
         register_stream_owner(stream_id, ephemeral.session_id)
         with STREAMS_LOCK:
             STREAMS[stream_id] = stream
+            # Launch-phase ownership claim (re-gate finding B): the reaper's sweep
+            # makes this load-bearing on EVERY registration edge, not just the two
+            # chat/start paths -- an unclaimed stream whose worker has not been
+            # admitted yet is indistinguishable from a dead one, and the sweep would
+            # harvest it before the worker runs the task.
+            publish_pre_admission_claim(stream_id, streams_lock_held=True)
         from api.background import track_btw
         track_btw(body["session_id"], ephemeral.session_id, stream_id, question)
         thr = threading.Thread(
@@ -23732,6 +23738,11 @@ def _handle_background(handler, body):
         register_stream_owner(stream_id, bg.session_id)
         with STREAMS_LOCK:
             STREAMS[stream_id] = stream
+            # Same launch-phase claim as every other registration edge (re-gate
+            # finding B): its worker is scheduled below, and until it admits itself
+            # the claim is the only thing that tells the reaper's sweep this stream
+            # is launching rather than dead.
+            publish_pre_admission_claim(stream_id, streams_lock_held=True)
         track_background(parent_sid, bg_sid, stream_id, task_id, prompt)
         thr = threading.Thread(target=_run_bg_and_notify, daemon=True)
         thr.start()
