@@ -46,6 +46,21 @@ def _drain(q):
             return drained
 
 
+def _mark_written(ch, q, at: float) -> None:
+    """Simulate the keepalives a live subscriber completes across a time jump.
+
+    These tests advance ``now`` past the stall window to drive the reaper. A live
+    connection proves itself to the writer on every keepalive, so a test that jumps
+    the clock forward on behalf of a HEALTHY subscriber must refresh that mark too.
+    Without it the test would assert that a socket with no completed write for the
+    whole window is alive -- the exact defect the writer-liveness signal catches.
+    No-op on a head that has no writer mark, so the historical behaviour is intact.
+    """
+    marks = getattr(ch, "_last_write_ok_at", None)
+    if marks is not None:
+        marks[q] = at
+
+
 def test_burst_then_drain_with_no_further_emit_is_not_reaped():
     """burst -> drain -> silence is a healthy quiet session, not a dead subscriber."""
     ch = bp.SessionChannel("sess-burst-drain-quiet")
@@ -55,6 +70,8 @@ def test_burst_then_drain_with_no_further_emit_is_not_reaped():
     assert _drain(q) > 0, "the subscriber never drained its backlog"
     # No further emit: nothing else happens on the session.
     future = time.time() + cfg.SESSION_CHANNEL_SUBSCRIBER_STALL_SECS + 1
+    # ...but a live subscriber proves itself on every keepalive in that window.
+    _mark_written(ch, q, future)
 
     assert ch._dead_subscriber_signal(future) is False, (
         "a subscriber that drained its queue was still counted as dead: the reaper "
@@ -106,6 +123,8 @@ def test_drained_subscriber_protects_the_channel_beside_a_stuck_one():
     ch.emit("bg_task_complete", {"dropped-for-both": True})
     _drain(drained)  # the healthy tab catches up
     future = time.time() + cfg.SESSION_CHANNEL_SUBSCRIBER_STALL_SECS + 1
+    # ...and keeps proving itself to the writer, one keepalive per interval.
+    _mark_written(ch, drained, future)
 
     assert ch.reaper_should_collect(future) is False, (
         "a stalled tab evicted a channel that a live, caught-up subscriber still held"

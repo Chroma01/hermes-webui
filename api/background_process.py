@@ -106,6 +106,11 @@ _PENDING_EMIT_TIMERS: dict[str, threading.Timer] = {}
 #   stream_end / cancel / reconnect.
 SESSION_CHANNELS: dict[str, "SessionChannel"] = {}
 SESSION_CHANNELS_LOCK = threading.Lock()
+# Keepalive interval of the session SSE writer (api/routes.py:
+# ``_SSE_HEARTBEAT_INTERVAL_SECONDS``). Mirrored here as a plain number on purpose:
+# routes imports this module, so importing back would be circular. It bounds how
+# often a HEALTHY idle subscriber proves itself to the writer-liveness signal.
+SESSION_CHANNEL_KEEPALIVE_SECS = 5.0
 
 
 class SessionChannel:
@@ -151,11 +156,22 @@ class SessionChannel:
         # so it never accumulates a stall run — only a genuinely stuck/ghost
         # subscriber does.
         self._stalled_since: dict[queue.Queue, float] = {}
+        # Writer-side liveness (re-gate finding 1): per-queue timestamp of the last
+        # write/flush that COMPLETED for that subscriber, whatever it carried --
+        # event frame or keepalive. This is the signal the queue can never give:
+        # an idle session never fills a 64-slot queue, so a half-open socket (the
+        # client vanished without a FIN reaching us) is invisible to the
+        # ``queue.Full`` evidence and its channel would zombie indefinitely.
+        self._last_write_ok_at: dict[queue.Queue, float] = {}
 
     def subscribe(self, maxsize: int = 16) -> queue.Queue:
         q: queue.Queue = queue.Queue(maxsize=maxsize)
         with self._lock:
             self._subscribers.append(q)
+            # Seed the writer-liveness mark: a brand-new subscriber has not written
+            # yet, and seeding at subscribe time gives it a full window before the
+            # reaper may judge it.
+            self._last_write_ok_at[q] = time.time()
             # Cancel any pending subscribers-empty grace timer.
             self.last_subscriber_drop_at = None
             already_closed = self._closed
@@ -179,8 +195,34 @@ class SessionChannel:
             except ValueError:
                 pass
             self._stalled_since.pop(q, None)
+            self._last_write_ok_at.pop(q, None)
             if not self._subscribers:
                 self.last_subscriber_drop_at = time.time()
+
+    def note_subscriber_write_ok(self, q: queue.Queue) -> None:
+        """Record that a write/flush to this subscriber's socket COMPLETED.
+
+        The SSE writer calls this after every successful write -- event frames and
+        keepalives alike. It is the only positive proof of life for a subscriber
+        that is idle: ``emit()`` cannot provide it (an idle session never fills the
+        queue, so no ``queue.Full`` is ever recorded) and the client's own
+        disappearance never reaches us (a half-open socket sends no FIN). A healthy
+        idle subscriber proves itself once per keepalive interval, which is exactly
+        what makes "no completed write for a whole window" positive evidence of
+        death rather than of quiet.
+
+        A write that FAILS is stronger, immediate evidence and needs no mark: the
+        handler's error path unsubscribes in its ``finally``.
+
+        Same clock as the reaper's ``now`` (``time.time()``), so the two are
+        directly comparable.
+        """
+        with self._lock:
+            if q in self._subscribers:
+                self._last_write_ok_at[q] = time.time()
+            else:
+                # Already unsubscribed: never keep a mark for a detached queue.
+                self._last_write_ok_at.pop(q, None)
 
     def subscriber_count(self) -> int:
         with self._lock:
@@ -368,13 +410,21 @@ class SessionChannel:
     def _dead_subscriber_signal(self, now: float) -> bool:
         """Positive evidence that EVERY attached subscriber is dead/stuck.
 
-        A subscriber counts as stalled when its queue has rejected a broadcast
-        (``queue.Full``) continuously for ``SESSION_CHANNEL_SUBSCRIBER_STALL_SECS``
-        — i.e. it has not drained a single event in that whole window. A live
-        tab drains on each event, so a healthy connection can never accumulate
-        a stall run. Returns False when there is no subscriber or when any one
-        of them is still draining (a single live subscriber protects the
-        channel, per the Option X contract).
+        Two independent signals, either one is enough per subscriber:
+
+        1. Queue pressure: the subscriber's queue has rejected a broadcast
+           (``queue.Full``) continuously for ``SESSION_CHANNEL_SUBSCRIBER_STALL_SECS``
+           — it has not drained a single event in that whole window. A live tab
+           drains on each event, so a healthy connection can never accumulate one.
+        2. Writer staleness (re-gate finding 1): no write to that subscriber has
+           COMPLETED for ``max(STALL_SECS, 3 x keepalive)``. Signal 1 is blind to a
+           half-open socket on an idle session, because a 64-slot queue never fills
+           up when nothing is emitted; the keepalive write is the only thing that
+           proves such a subscriber is still there.
+
+        Returns False when there is no subscriber or when any one of them is still
+        alive (a single live subscriber protects the channel, per the Option X
+        contract).
         """
         with self._lock:
             return self._dead_subscriber_signal_locked(now)
@@ -394,15 +444,27 @@ class SessionChannel:
         for q in self._subscribers:
             if q in self._stalled_since and self._queue_has_capacity(q):
                 self._stalled_since.pop(q, None)
-        stalled = [
-            self._stalled_since[q]
-            for q in self._subscribers
-            if q in self._stalled_since
-        ]
-        if sub_count == 0 or len(stalled) != sub_count:
-            return False
         window = float(getattr(_cfg, "SESSION_CHANNEL_SUBSCRIBER_STALL_SECS", 300))
-        return all((now - since) >= window for since in stalled)
+        # Writer staleness window: max(stall window, 3 keepalive ticks). The
+        # multiplier buys tolerance for a couple of missed keepalive ticks
+        # (scheduler jitter, one slow flush), which is why 3 and not 1: a live but
+        # quiet subscriber must never be called dead. With the current 5 s
+        # keepalive the stall window dominates (300 s), so this only tightens if
+        # the keepalive interval is ever raised past 100 s.
+        stale_after = max(window, 3.0 * SESSION_CHANNEL_KEEPALIVE_SECS)
+        dead = 0
+        for q in self._subscribers:
+            queue_stalled = (
+                q in self._stalled_since
+                and (now - self._stalled_since[q]) >= window
+            )
+            last_ok = self._last_write_ok_at.get(q)
+            write_stale = last_ok is None or (now - last_ok) >= stale_after
+            if queue_stalled or write_stale:
+                dead += 1
+        if sub_count == 0 or dead != sub_count:
+            return False
+        return True
 
     def reaper_should_collect(self, now: float) -> bool:
         """True when the reaper should remove this channel.

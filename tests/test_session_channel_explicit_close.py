@@ -51,6 +51,20 @@ def _drive_reaper_until(predicate, timeout: float = 3.0, interval: float = 0.02)
         del started  # only recorded for symmetry with start/stop pairing
 
 
+def _mark_written(ch, q, at: float) -> None:
+    """Simulate the keepalives a live subscriber completes across a time jump.
+
+    Tests that advance ``now`` past the stall window on behalf of a HEALTHY
+    subscriber must refresh its writer mark too: a live connection proves itself on
+    every keepalive. Without it the test would assert that a socket with no
+    completed write for the whole window is alive -- the defect the writer-liveness
+    signal catches. No-op on a head without the mark.
+    """
+    marks = getattr(ch, "_last_write_ok_at", None)
+    if marks is not None:
+        marks[q] = at
+
+
 # ---------------------------------------------------------------------------
 # close(): the explicit protocol
 # ---------------------------------------------------------------------------
@@ -165,9 +179,11 @@ def test_reaper_keeps_channel_when_any_subscriber_still_drains():
     ch = bp.SessionChannel("sess-mixed")
     stalled = ch.subscribe(maxsize=1)
     stalled.put_nowait(("bg_task_complete", {"filler": True}))
-    ch.subscribe()  # healthy, roomy subscriber
+    healthy = ch.subscribe()  # healthy, roomy subscriber
     ch.emit("bg_task_complete", {"dropped-for-stalled": True})
     future = time.time() + cfg.SESSION_CHANNEL_SUBSCRIBER_STALL_SECS + 1
+    # The healthy tab proves itself to the writer on every keepalive in that window.
+    _mark_written(ch, healthy, future)
 
     assert ch.reaper_should_collect(future) is False
 
@@ -181,6 +197,8 @@ def test_stall_run_is_cleared_once_the_subscriber_drains():
     q.get_nowait()  # tab drains again
     ch.emit("bg_task_complete", {"delivered": True})  # success clears the run
     future = time.time() + cfg.SESSION_CHANNEL_SUBSCRIBER_STALL_SECS + 1
+    # A resumed tab also completes a keepalive every interval for the whole window.
+    _mark_written(ch, q, future)
 
     assert ch.reaper_should_collect(future) is False
 

@@ -22421,6 +22421,11 @@ def _handle_session_sse_stream(handler, parsed):
                 payload = q.get(timeout=_SSE_HEARTBEAT_INTERVAL_SECONDS)
             except queue.Empty:
                 _sse_keepalive(handler)
+                # A completed keepalive is proof of life for an idle subscriber
+                # (re-gate finding 1): without this mark the reaper cannot tell a
+                # quiet-but-healthy tab from a half-open socket on an idle session,
+                # because an idle session never fills a subscriber's queue.
+                ch.note_subscriber_write_ok(q)
                 continue
             if payload is None:
                 # End-of-stream sentinel: the channel was deliberately closed
@@ -22445,6 +22450,10 @@ def _handle_session_sse_stream(handler, parsed):
                 break
             event_name, data = payload
             _sse(handler, event_name, data)
+            # Delivered: that write completed, so this subscriber is alive right
+            # now (re-gate finding 1). A write that raises instead never reaches
+            # this line, and its handler path unsubscribes in the finally below.
+            ch.note_subscriber_write_ok(q)
     except _CLIENT_DISCONNECT_ERRORS:
         pass  # client went away — normal for long-lived connections
     finally:
