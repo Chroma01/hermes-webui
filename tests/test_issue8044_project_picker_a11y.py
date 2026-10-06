@@ -514,4 +514,15 @@ def test_single_picker_height_is_clamped_to_the_viewport_room():
     left on its side of the anchor."""
     js = (Path(__file__).resolve().parent.parent / "static" / "sessions.js").read_text(encoding="utf-8")
     assert "const _pickerRoom=picker.style.top==='auto'?(rect.top-4-8):(window.innerHeight-(rect.bottom+4)-8);" in js
-    assert "picker.style.maxHeight=Math.max(132,_pickerRoom)+'px';" in js
+    assert "picker.style.maxHeight=_pickerRoom+'px';" in js
+
+
+def test_single_picker_takes_the_screen_when_neither_side_of_its_anchor_has_room():
+    """Gate 2026-10-06, second pass: a 132px floor beside a tall anchor (a parent row with
+    its forks open, on a phone on its side) pushed "+ New project" below the screen."""
+    js = (Path(__file__).resolve().parent.parent / "static" / "sessions.js").read_text(encoding="utf-8")
+    assert "Math.max(132,_pickerRoom)" not in js
+    fallback = _between(js, "if(_pickerRoom<132){", "}else{")
+    assert "picker.style.top='8px';" in fallback
+    assert "picker.style.bottom='auto';" in fallback
+    assert "picker.style.maxHeight=(window.innerHeight-16)+'px';" in fallback

@@ -149,10 +149,11 @@ language; in a touch context, with the drawer open, every row must be at least
 44px tall; and in a long list the focused row must be inside the picker's box,
 or, in the batch picker, scrolled onto the screen by the conversation list.
 With forty more conversations and fifteen projects, a mouse wheel over the open
-batch picker must still scroll the conversation list, and on three phone sizes
+batch picker must still scroll the conversation list, and on four phone sizes
 every row of the single picker must be tappable wherever in the list it was
-opened, with the batch picker scrolling inside its cap (#8044). Run it locally
-with
+opened, with the batch picker scrolling inside its cap; on the two landscape
+sizes the same must hold from a parent conversation whose open forks make its
+row taller than the room beside it (#8044). Run it locally with
 `python tests/browser_project_picker_keyboard.py`; add `--screenshots DIR` to
 write the open picker at 390x844, 820x1180, 844x390 and 1440x900.
 

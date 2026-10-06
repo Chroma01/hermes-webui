@@ -10095,7 +10095,15 @@ function _showProjectPicker(session, anchorEl){
   // Never run past the viewport edge: with 44px touch rows and many projects the picker
   // used to extend below the screen, leaving "+ New project" unreachable. Scroll inside it.
   const _pickerRoom=picker.style.top==='auto'?(rect.top-4-8):(window.innerHeight-(rect.bottom+4)-8);
-  picker.style.maxHeight=Math.max(132,_pickerRoom)+'px';
+  if(_pickerRoom<132){
+    // A tall anchor on a short screen (a parent row with its forks open, on a phone
+    // on its side) leaves under three rows on either side: take the screen instead.
+    picker.style.top='8px';
+    picker.style.bottom='auto';
+    picker.style.maxHeight=(window.innerHeight-16)+'px';
+  }else{
+    picker.style.maxHeight=_pickerRoom+'px';
+  }
   // Align right edge of picker with right edge of button; keep within viewport
   const pickerW=Math.min(220,Math.max(160,picker.scrollWidth||160));
   let left=rect.right-pickerW;
