@@ -10179,10 +10179,15 @@ function _focusProjectPickerItem(picker){
 // since, which replaces all of them: then it is the trigger of the row now
 // showing the session.
 function _projectPickerFocusReturnTarget(session, anchorEl){
+  const rowOf=el=>el.closest('.session-item,.session-child-session');
   const triggerOf=el=>{
     if(!el||!el.isConnected) return null;
     if(el.classList&&el.classList.contains('session-actions-trigger')) return el;
-    return el.querySelector('.session-actions-trigger');
+    // An expanded parent row also holds its fork children's rows, each with a
+    // trigger of its own, and they come before the parent's in the DOM: take
+    // the trigger that belongs to this row, not the first one inside it.
+    const row=rowOf(el);
+    return Array.from(el.querySelectorAll('.session-actions-trigger')).find(trigger=>rowOf(trigger)===row)||null;
   };
   return triggerOf(anchorEl)||triggerOf(_findSessionRenameRow(session&&session.session_id));
 }

@@ -27,6 +27,10 @@ WHAT IT CHECKS
   - rows are buttons, focus lands on the first, "No project" is translated;
   - Escape closes it and focus returns to the bar's "Move to project" button;
   - it still sits inside the selection bar.
+  a conversation with a fork, its row expanded
+  - the parent row then holds the fork's row, and the fork's ⋮ trigger comes
+    first inside it; opened from the parent by a right click, Escape returns
+    focus to the parent's own trigger, also after a sidebar repaint.
   a long list (twelve more projects, a 420px-tall window)
   - the picker scrolls inside itself, and the row that End, Home or opening
     puts focus on is inside the picker's visible box.
@@ -515,6 +519,71 @@ def _check_heights(page, seed, *, coarse):
     return failures
 
 
+FORK_SETUP_JS = """async (sid) => {
+  const response = await fetch('/api/session/branch', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({session_id: sid, title: 'Beta fork'}),
+  });
+  const data = await response.json();
+  if (!response.ok || !data.session_id) return {problem: 'fork failed: ' + JSON.stringify(data)};
+  await renderSessionList();
+  const row = () => document.querySelector('.session-item[data-sid="' + sid + '"]');
+  const toggle = row() && row().querySelector('.session-child-count');
+  if (!toggle) return {problem: 'the parent row has no child-count toggle'};
+  toggle.click();
+  const triggers = Array.from(row().querySelectorAll('.session-actions-trigger'));
+  const rowOf = el => el.closest('.session-item,.session-child-session');
+  return {
+    fork: data.session_id,
+    triggers: triggers.length,
+    firstBelongsToParent: triggers.length ? rowOf(triggers[0]) === row() : null,
+  };
+}"""
+
+
+def _check_fork_parent(page, seed):
+    """The parent's picker returns focus to the parent's trigger, not the fork's."""
+    beta = seed["beta"]
+    setup = page.evaluate(FORK_SETUP_JS, beta)
+    if setup.get("problem"):
+        return [f"  [fork parent] {setup['problem']}"]
+    if setup["triggers"] < 2 or setup["firstBelongsToParent"]:
+        # Without this shape the check below would pass for the wrong reason.
+        return [f"  [fork parent] the expanded parent row does not hold a fork's trigger first: {setup}"]
+    failures = []
+    for repaint in (False, True):
+        label = "after a sidebar repaint, " if repaint else ""
+        page.wait_for_timeout(SETTLE_MS)
+        page.click(f'.session-item[data-sid="{beta}"] .session-title', button="right")
+        if not _wait_until(page, "!!document.querySelector('.session-action-menu')", 1500):
+            return failures + ["  [fork parent] a right click on the parent row did not open the ⋮ menu"]
+        page.evaluate(
+            """() => {
+              const label = t('session_move_project');
+              Array.from(document.querySelectorAll('.session-action-menu .session-action-opt'))
+                .find(opt => opt.textContent.trim() === label).focus();
+            }"""
+        )
+        page.keyboard.press("Enter")
+        if not _wait_until(page, f"!!document.querySelector('{SINGLE}')", 1500):
+            return failures + ["  [fork parent] the picker did not open from the parent's menu"]
+        if repaint:
+            page.evaluate("renderSessionListFromCache()")
+            page.evaluate(f"document.querySelector('{SINGLE} .project-picker-item').focus()")
+        page.keyboard.press("Escape")
+        page.wait_for_timeout(100)
+        if not page.evaluate(FOCUSED_TRIGGER_JS, beta):
+            where = page.evaluate(
+                "(() => { const a = document.activeElement; const row = a && a.closest"
+                " && a.closest('.session-item,.session-child-session');"
+                " return (a ? a.tagName + '.' + a.className : 'nothing') + ' in row ' + (row ? row.dataset.sid : 'none'); })()"
+            )
+            failures.append(
+                f"  [fork parent] {label}Escape returned focus to {where}, expected the parent's ⋮ trigger"
+            )
+    return failures
+
+
 ROW_IN_BOX_JS = """() => {
   const picker = document.querySelector('.project-picker:not(.batch-project-picker)');
   const row = document.activeElement;
@@ -659,6 +728,10 @@ def main():
             failures.extend(found)
             if not found:
                 print("OK  mouse — rows keep their compact height")
+            found = _check_fork_parent(page, seed)
+            failures.extend(found)
+            if not found:
+                print("OK  fork parent — focus returns to the parent's own trigger")
             failures.extend(f"  [desktop] pageerror: {err}" for err in errors)
             ctx.close()
 

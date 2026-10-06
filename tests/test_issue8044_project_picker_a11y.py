@@ -51,6 +51,12 @@ class El {
     this.rect = {top: 0, bottom: 0};
     this.classList = {contains: name => this.hasClass(name)}; }
   getBoundingClientRect(){ return this.rect; }
+  closest(selector){
+    if (selector !== '.session-item,.session-child-session') throw new Error('unexpected selector ' + selector);
+    for (let el = this; el; el = el.parent)
+      if (el.hasClass('session-item') || el.hasClass('session-child-session')) return el;
+    return null;
+  }
   setAttribute(name, value){ this.attrs[name] = String(value); }
   getAttribute(name){ return Object.prototype.hasOwnProperty.call(this.attrs, name) ? this.attrs[name] : null; }
   appendChild(child){ this.children.push(child); child.parent = this; return child; }
@@ -61,6 +67,11 @@ class El {
   querySelectorAll(selector){
     if (selector === '.project-picker-item:not([disabled])')
       return this.children.filter(c => c.hasClass('project-picker-item') && !c.disabled);
+    if (selector === '.session-actions-trigger') {
+      // Document order, like the real thing.
+      const all = el => el.children.flatMap(c => (c.hasClass('session-actions-trigger') ? [c] : []).concat(all(c)));
+      return all(this);
+    }
     throw new Error('unexpected selector ' + selector);
   }
   querySelector(selector){
@@ -68,10 +79,7 @@ class El {
       return this.children.find(c => c.hasClass('project-picker-item') && c.hasClass('active')) || null;
     if (selector === '.project-picker-item')
       return this.children.find(c => c.hasClass('project-picker-item')) || null;
-    if (selector === '.session-actions-trigger') {
-      const find = el => el.hasClass('session-actions-trigger') ? el : el.children.map(find).find(Boolean) || null;
-      return this.children.map(find).find(Boolean) || null;
-    }
+    if (selector === '.session-actions-trigger') return this.querySelectorAll(selector)[0] || null;
     throw new Error('unexpected selector ' + selector);
   }
 }
@@ -223,6 +231,46 @@ console.log(JSON.stringify({
 }));
 """)
     assert out == {"fromRow": "of this row", "fromActions": "of this row"}
+
+
+def test_a_parent_row_returns_its_own_trigger_not_a_fork_childs():
+    """An expanded parent row holds its fork children's rows, and they sit
+    before the parent's own actions box in the DOM. The first trigger inside
+    the parent row is therefore a child's."""
+    out = _run(SIDEBAR_ROW + r"""
+const parent = new El('div'); parent.className = 'session-item';
+const text = parent.appendChild(new El('div'));
+const childList = text.appendChild(new El('div'));
+const children = ['first fork', 'second fork'].map(name => {
+  const child = childList.appendChild(new El('div')); child.className = 'session-child-session session-child-session-fork';
+  const actions = child.appendChild(new El('div'));
+  const trigger = actions.appendChild(new El('button')); trigger.className = 'session-actions-trigger';
+  trigger.label = name;
+  return {child, actions, trigger};
+});
+const parentActions = parent.appendChild(new El('div'));
+const parentTrigger = parentActions.appendChild(new El('button'));
+parentTrigger.className = 'session-actions-trigger'; parentTrigger.label = 'parent';
+rowsBySid['parent'] = parent;
+rowsBySid['fork'] = children[1].child;
+const detached = new El('button'); detached.isConnected = false;
+console.log(JSON.stringify({
+  first: label(parent.querySelector('.session-actions-trigger')),
+  fromParentRow: label(_projectPickerFocusReturnTarget({session_id: 'parent'}, parent)),
+  fromParentActions: label(_projectPickerFocusReturnTarget({session_id: 'parent'}, parentActions)),
+  fromChildRow: label(_projectPickerFocusReturnTarget({session_id: 'fork'}, children[1].child)),
+  parentAfterRepaint: label(_projectPickerFocusReturnTarget({session_id: 'parent'}, detached)),
+  childAfterRepaint: label(_projectPickerFocusReturnTarget({session_id: 'fork'}, detached)),
+}));
+""")
+    assert out == {
+        "first": "first fork",  # what a plain querySelector would hand back
+        "fromParentRow": "parent",
+        "fromParentActions": "parent",
+        "fromChildRow": "second fork",
+        "parentAfterRepaint": "parent",
+        "childAfterRepaint": "second fork",
+    }
 
 
 def test_after_a_repaint_focus_returns_to_the_rows_new_trigger():
