@@ -2924,7 +2924,6 @@ from api.config import (
     LOCK,
     STREAMS,
     STREAMS_LOCK,
-    PRE_ADMISSION_CLAIMS,
     CANCEL_FLAGS,
     STREAM_LAST_EVENT_ID,
     SERVER_START_TIME,
