@@ -246,12 +246,17 @@ def test_unreadable_liveness_registry_fails_closed():
     session = _Session(active_stream_id=stream_id, session_id="unknown-liveness-session")
     config.STREAMS[stream_id] = queue.Queue()
     routes_active_runs_lock = routes.ACTIVE_RUNS_LOCK
+    config_active_runs_lock = config.ACTIVE_RUNS_LOCK
     routes.ACTIVE_RUNS_LOCK = _ExplodingLock()
+    # The orphan predicate resolves the worker-registry lock from api.config at
+    # call time, so that binding is the one a broken registry must explode through.
+    config.ACTIVE_RUNS_LOCK = _ExplodingLock()
     try:
         assert routes._active_stream_blocks_chat_start(session, stream_id) is True
         assert stream_id in config.STREAMS
     finally:
         routes.ACTIVE_RUNS_LOCK = routes_active_runs_lock
+        config.ACTIVE_RUNS_LOCK = config_active_runs_lock
 
 
 def test_orphan_clear_is_scoped_to_the_exact_stream_id():
@@ -355,10 +360,24 @@ class _NoopThread:
 
 
 def _patch_stream_start(monkeypatch, stream_ids=("new-stream",)):
-    ids = iter(stream_ids)
-    monkeypatch.setattr(
-        routes.uuid, "uuid4", lambda: type("FakeUuid", (), {"hex": next(ids)})()
-    )
+    """Stub uuid4: the named ids come first, then synthesized ones.
+
+    The chat/start path legitimately consumes MORE than one id per request — the
+    launch-phase claim token is a uuid too — so a finite iterator raises
+    StopIteration instead of exercising the path.
+    """
+    named = list(stream_ids)
+    extra = [0]
+
+    def _fake_uuid():
+        if named:
+            hex_id = named.pop(0)
+        else:
+            extra[0] += 1
+            hex_id = f"generated-stream-{extra[0]}"
+        return type("FakeUuid", (), {"hex": hex_id})()
+
+    monkeypatch.setattr(routes.uuid, "uuid4", _fake_uuid)
     monkeypatch.setattr(routes, "set_last_workspace", lambda workspace, **_kw: None)
     monkeypatch.setattr(routes, "create_stream_channel", lambda: queue.Queue())
     monkeypatch.setattr(routes.threading, "Thread", _NoopThread)
