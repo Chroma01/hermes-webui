@@ -137,14 +137,17 @@ session list once before that, and shows the new row once the list is released
 It also runs `tests/browser_project_picker_keyboard.py`, which imports two
 conversations and creates three projects through the API and then drives both
 "Move to project" pickers. The single-conversation picker is opened from the ⋮
-menu with the keyboard: its rows must be buttons in a menu, focus must open on
-the conversation's current project, ArrowDown/ArrowUp must wrap and Home/End
-jump, Escape must close it and return focus to the conversation's ⋮ trigger
-(also after a sidebar repaint replaced that trigger), and Enter, Space and a
-click must each send the move. The batch picker must open on its first row and
-return focus to the selection bar's Move button. "No project" and "+ New
-project" must follow the interface language, and in a touch context every row
-must be at least 44px tall (#8044). Run it locally with
+menu with the keyboard: its rows must be buttons in a named menu, focus must
+open on the conversation's current project, ArrowDown/ArrowUp must wrap and
+Home/End jump, Tab must close it, Escape must close it and return focus to the
+conversation's ⋮ trigger (also after a sidebar repaint replaced that trigger,
+after a right-click open, and for a parent row whose expanded fork has a
+trigger of its own), and Enter, Space and a click must each send the move. The
+batch picker must open on its first row and return focus to the selection
+bar's Move button. "No project" and "+ New project" must follow the interface
+language; in a touch context, with the drawer open, every row must be at least
+44px tall; and in a long list the focused row must be inside the picker's box
+(#8044). Run it locally with
 `python tests/browser_project_picker_keyboard.py`; add `--screenshots DIR` to
 write the open picker at 390x844, 844x390 and 1440x900.
 

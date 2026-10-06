@@ -48,15 +48,10 @@ const body = {tagName: 'BODY'};
 class El {
   constructor(tag){ this.tagName = tag.toUpperCase(); this.attrs = {}; this.children = []; this.className = '';
     this.isConnected = true; this.listeners = {}; this.disabled = false; this.scrollTop = 0;
-    this.rect = {top: 0, bottom: 0};
+    this.rect = {top: 0, bottom: 0}; this.clientTop = 0;
     this.classList = {contains: name => this.hasClass(name)}; }
   getBoundingClientRect(){ return this.rect; }
-  closest(selector){
-    if (selector !== '.session-item,.session-child-session') throw new Error('unexpected selector ' + selector);
-    for (let el = this; el; el = el.parent)
-      if (el.hasClass('session-item') || el.hasClass('session-child-session')) return el;
-    return null;
-  }
+  get clientHeight(){ return this.rect.bottom - this.rect.top - 2 * this.clientTop; }
   setAttribute(name, value){ this.attrs[name] = String(value); }
   getAttribute(name){ return Object.prototype.hasOwnProperty.call(this.attrs, name) ? this.attrs[name] : null; }
   appendChild(child){ this.children.push(child); child.parent = this; return child; }
@@ -80,6 +75,11 @@ class El {
     if (selector === '.project-picker-item')
       return this.children.find(c => c.hasClass('project-picker-item')) || null;
     if (selector === '.session-actions-trigger') return this.querySelectorAll(selector)[0] || null;
+    if (selector === ':scope > .session-actions-trigger, :scope > .session-actions > .session-actions-trigger') {
+      const direct = el => el.children.find(c => c.hasClass('session-actions-trigger')) || null;
+      return direct(this)
+        || this.children.filter(c => c.hasClass('session-actions')).map(direct).find(Boolean) || null;
+    }
     throw new Error('unexpected selector ' + selector);
   }
 }
@@ -182,13 +182,25 @@ console.log(JSON.stringify(seen));
 
 
 def test_other_keys_are_left_to_the_button():
-    """Enter and Space activate a button natively; Tab moves on as usual."""
+    """Enter and Space activate a button natively."""
     out = _run(PICKER_WITH_ROWS + r"""
 rows[0].focus();
-const seen = ['Enter', ' ', 'Tab', 'a'].map(name => { const event = press(name); return [event.prevented, focused()]; });
+const seen = ['Enter', ' ', 'a'].map(name => { const event = press(name); return [event.prevented, focused()]; });
 console.log(JSON.stringify({seen, escaped}));
 """)
-    assert out == {"seen": [[False, "No project"]] * 4, "escaped": 0}
+    assert out == {"seen": [[False, "No project"]] * 3, "escaped": 0}
+
+
+def test_tab_closes_the_picker_and_is_left_to_the_browser():
+    """Tab used to move focus out and leave the picker open, where no key
+    could reach it again: the key listener is on the picker. It closes like
+    Escape, but the Tab itself is not swallowed, so focus moves on."""
+    out = _run(PICKER_WITH_ROWS + r"""
+rows[3].focus();
+const event = press('Tab');
+console.log(JSON.stringify({escaped, prevented: event.prevented, stopped: event.stopped}));
+""")
+    assert out == {"escaped": 1, "prevented": False, "stopped": False}
 
 
 def test_escape_runs_the_close_handler_and_goes_no_further():
@@ -243,12 +255,12 @@ const text = parent.appendChild(new El('div'));
 const childList = text.appendChild(new El('div'));
 const children = ['first fork', 'second fork'].map(name => {
   const child = childList.appendChild(new El('div')); child.className = 'session-child-session session-child-session-fork';
-  const actions = child.appendChild(new El('div'));
+  const actions = child.appendChild(new El('div')); actions.className = 'session-actions';
   const trigger = actions.appendChild(new El('button')); trigger.className = 'session-actions-trigger';
   trigger.label = name;
   return {child, actions, trigger};
 });
-const parentActions = parent.appendChild(new El('div'));
+const parentActions = parent.appendChild(new El('div')); parentActions.className = 'session-actions';
 const parentTrigger = parentActions.appendChild(new El('button'));
 parentTrigger.className = 'session-actions-trigger'; parentTrigger.label = 'parent';
 rowsBySid['parent'] = parent;
@@ -293,7 +305,8 @@ def test_a_focused_row_is_scrolled_into_the_pickers_box():
     """The focus call itself must not scroll, so a row beyond the edge of a
     long picker is brought in by moving the picker's own scroll position."""
     out = _run(PICKER_WITH_ROWS + r"""
-picker.rect = {top: 100, bottom: 300};
+picker.rect = {top: 99, bottom: 301};   // a 1px border around a 100..300 box
+picker.clientTop = 1;
 picker.scrollTop = 50;
 const seen = [];
 for (const [index, top, bottom] of [[3, 320, 364], [0, 60, 104], [1, 120, 164], [2, 256, 300]]) {
@@ -310,9 +323,26 @@ console.log(JSON.stringify({seen, refused, after: picker.scrollTop}));
         ["+ New project", 114],  # 64px below the box
         ["No project", 10],      # 40px above it
         ["Research", 50],        # inside: untouched
-        ["Client work", 50],     # flush with the bottom edge: untouched
+        ["Client work", 50],     # flush with the inner bottom edge: untouched
     ]
     assert out["refused"] is False and out["after"] == 50
+
+
+def test_the_reveal_stops_inside_the_pickers_border():
+    """Measured against the border box, the last row would overhang by the
+    border's width and its focus ring would be clipped."""
+    out = _run(PICKER_WITH_ROWS + r"""
+picker.rect = {top: 99, bottom: 301};
+picker.clientTop = 1;
+rows[3].rect = {top: 257, bottom: 301};   // inside the border box, 1px past the inner edge
+_focusProjectPickerRow(picker, rows[3]);
+const below = picker.scrollTop;
+picker.scrollTop = 20;
+rows[0].rect = {top: 99, bottom: 143};    // the same at the top
+_focusProjectPickerRow(picker, rows[0]);
+console.log(JSON.stringify({below, above: picker.scrollTop}));
+""")
+    assert out == {"below": 1, "above": 19}
 
 
 def test_opening_reveals_the_current_project_too():
@@ -353,6 +383,9 @@ def test_both_pickers_wire_the_keys_and_focus_a_row_on_open():
         assert "_wireProjectPickerKeys(picker," in body, name
         assert "_focusProjectPickerItem(picker)" in body, name
     assert "_focusSessionActionMenuRestoreTarget(openerEl)" in BATCH_PICKER
+    # Each menu has a name: the label of the control that opens it.
+    assert "picker.setAttribute('aria-label',t('session_batch_move'))" in BATCH_PICKER
+    assert "picker.setAttribute('aria-label',t('session_move_project'))" in SINGLE_PICKER
     assert "_focusSessionActionMenuRestoreTarget(_projectPickerFocusReturnTarget(session,anchorEl))" in SINGLE_PICKER
     # The selection bar hands its Move button over as the place to return to.
     assert "_showBatchProjectPicker(moveBtn)" in SESSIONS_JS

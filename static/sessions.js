@@ -4964,6 +4964,7 @@ function _showBatchProjectPicker(openerEl){
   const close=(e)=>{if(!picker.contains(e.target)){picker.remove();document.removeEventListener('click',close);}};
   setTimeout(()=>document.addEventListener('click',close),0);
   // Escape closes the picker and hands focus back to the Move button (#8044).
+  picker.setAttribute('aria-label',t('session_batch_move'));
   _wireProjectPickerKeys(picker,()=>{
     picker.remove();document.removeEventListener('click',close);
     _focusSessionActionMenuRestoreTarget(openerEl);
@@ -10129,7 +10130,9 @@ function _projectPickerItem(extraClass, active){
 }
 
 // Menu keys for a project picker, as on the session ⋮ menu: ArrowDown/ArrowUp
-// wrap, Home/End jump, Escape runs `onEscape`.
+// wrap, Home/End jump, Escape runs `onEscape`. Tab closes the menu too and is
+// then left to the browser, so focus moves on from where the picker was opened
+// instead of leaving an open picker behind that no key can reach any more.
 function _wireProjectPickerKeys(picker, onEscape){
   picker.setAttribute('role','menu');
   const pickerItems=()=>Array.from(picker.querySelectorAll('.project-picker-item:not([disabled])'));
@@ -10137,6 +10140,10 @@ function _wireProjectPickerKeys(picker, onEscape){
     if(e.key==='Escape'){
       e.preventDefault();
       e.stopPropagation();
+      onEscape();
+      return;
+    }
+    if(e.key==='Tab'){
       onEscape();
       return;
     }
@@ -10159,10 +10166,12 @@ function _wireProjectPickerKeys(picker, onEscape){
 // edge of a long, scrolling picker is revealed here instead.
 function _focusProjectPickerRow(picker, row){
   if(!_focusSessionActionMenuRestoreTarget(row)) return false;
-  const box=picker.getBoundingClientRect();
+  // Inside the picker's border, or the edge row's focus ring is clipped.
+  const top=picker.getBoundingClientRect().top+picker.clientTop;
+  const bottom=top+picker.clientHeight;
   const rect=row.getBoundingClientRect();
-  if(rect.top<box.top) picker.scrollTop-=box.top-rect.top;
-  else if(rect.bottom>box.bottom) picker.scrollTop+=rect.bottom-box.bottom;
+  if(rect.top<top) picker.scrollTop-=top-rect.top;
+  else if(rect.bottom>bottom) picker.scrollTop+=rect.bottom-bottom;
   return true;
 }
 
@@ -10179,15 +10188,14 @@ function _focusProjectPickerItem(picker){
 // since, which replaces all of them: then it is the trigger of the row now
 // showing the session.
 function _projectPickerFocusReturnTarget(session, anchorEl){
-  const rowOf=el=>el.closest('.session-item,.session-child-session');
   const triggerOf=el=>{
     if(!el||!el.isConnected) return null;
     if(el.classList&&el.classList.contains('session-actions-trigger')) return el;
     // An expanded parent row also holds its fork children's rows, each with a
-    // trigger of its own, and they come before the parent's in the DOM: take
-    // the trigger that belongs to this row, not the first one inside it.
-    const row=rowOf(el);
-    return Array.from(el.querySelectorAll('.session-actions-trigger')).find(trigger=>rowOf(trigger)===row)||null;
+    // trigger of its own, and they come before the parent's in the DOM. Only
+    // the row's own trigger will do: a child of the actions box, which is a
+    // child of the row.
+    return el.querySelector(':scope > .session-actions-trigger, :scope > .session-actions > .session-actions-trigger');
   };
   return triggerOf(anchorEl)||triggerOf(_findSessionRenameRow(session&&session.session_id));
 }

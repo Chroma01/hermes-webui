@@ -12,9 +12,10 @@ WHY THIS EXISTS
 
 WHAT IT CHECKS
   single-conversation picker, opened from the ⋮ menu with the keyboard
-  - the picker is a menu of buttons, and focus lands on the conversation's
-    current project;
+  - the picker is a named menu of buttons, and focus lands on the
+    conversation's current project;
   - ArrowDown / ArrowUp wrap, Home / End jump;
+  - Tab closes it instead of leaving it open behind the focus;
   - Escape closes it and focus returns to the conversation's ⋮ trigger, also
     when the sidebar was repainted while the picker was open (the original
     trigger is gone by then);
@@ -34,7 +35,7 @@ WHAT IT CHECKS
   a long list (twelve more projects, a 420px-tall window)
   - the picker scrolls inside itself, and the row that End, Home or opening
     puts focus on is inside the picker's visible box.
-  rows under a coarse pointer (a touch context, 390x844)
+  rows under a coarse pointer (a touch context, 390x844, the sidebar drawer open)
   - every row of both pickers is at least 44px tall; with a mouse they keep
     their compact height.
 
@@ -148,6 +149,7 @@ PICKER_JS = """(selector) => {
   const rows = Array.from(picker.querySelectorAll('.project-picker-item'));
   return {
     role: picker.getAttribute('role'),
+    label: picker.getAttribute('aria-label'),
     insideBatchBar: !!picker.closest('#batchActionBar'),
     rows: rows.map(row => ({
       tag: row.tagName,
@@ -255,6 +257,8 @@ def _check_single(page, seed):
         fail(f"rows are {texts}, expected {expected}")
     if picker["role"] != "menu":
         fail(f"the picker's role is {picker['role']!r}, expected 'menu'")
+    if picker["label"] != "Move to project":
+        fail(f"the picker's accessible name is {picker['label']!r}, expected 'Move to project'")
     not_buttons = [row["text"] for row in picker["rows"] if row["tag"] != "BUTTON" or row["type"] != "button"]
     if not_buttons:
         fail(f"rows that are not <button type=button>: {not_buttons}")
@@ -305,6 +309,22 @@ def _check_single(page, seed):
         page.wait_for_timeout(100)
         if not page.evaluate(FOCUSED_TRIGGER_JS, alpha):
             fail("after a sidebar repaint, Escape did not return focus to the conversation's new ⋮ trigger")
+
+    # Tab closes the picker. Left open, it would sit there with focus gone
+    # from it and no key able to reach it.
+    problem = _open_single_picker(page, alpha)
+    if problem:
+        return failures + [f"  [single] reopen: {problem}"]
+    page.keyboard.press("End")
+    page.keyboard.press("Tab")
+    if not _wait_until(page, f"!document.querySelector('{SINGLE}')", 1500):
+        fail("Tab left the picker open")
+        page.evaluate(f"document.querySelectorAll('{SINGLE}').forEach(p => p.remove())")
+    elif page.evaluate("!document.activeElement || document.activeElement === document.body"):
+        fail("after Tab focus is on nothing")
+    elif page.evaluate(FOCUSED_TRIGGER_JS, alpha):
+        # The Tab itself is the browser's: from the trigger it moves on.
+        fail("Tab was swallowed: focus stopped on the conversation's ⋮ trigger")
 
     # Opened by a right click on the row: the menu's anchor is the row (or its
     # actions box), not the trigger. Escape still lands on the trigger.
@@ -438,6 +458,8 @@ def _check_batch(page, seed):
         fail("the batch picker is not inside the selection bar")
     if picker["role"] != "menu":
         fail(f"the picker's role is {picker['role']!r}, expected 'menu'")
+    if picker["label"] != "Zum Projekt verschieben":
+        fail(f"the picker's accessible name is {picker['label']!r}, expected the Move button's label in German")
     not_buttons = [row["text"] for row in picker["rows"] if row["tag"] != "BUTTON" or row["type"] != "button"]
     if not_buttons:
         fail(f"rows that are not <button type=button>: {not_buttons}")
@@ -472,6 +494,7 @@ ROW_HEIGHTS_JS = """({alpha, beta}) => {
   const row = document.querySelector('.session-item[data-sid="' + alpha + '"]');
   const session = _allSessions.find(s => s && s.session_id === alpha);
   if (!row || !session) return {problem: 'the conversation has no sidebar row'};
+  const rowLeft = Math.round(row.getBoundingClientRect().left);
   if (!_sessionSelectMode) toggleSessionSelectMode();
   setSessionSelected(alpha, true);
   setSessionSelected(beta, true);
@@ -487,6 +510,7 @@ ROW_HEIGHTS_JS = """({alpha, beta}) => {
   const single = document.querySelector('.project-picker:not(.batch-project-picker)');
   if (!single) return {problem: 'the conversation picker did not open'};
   result.single = heights(single);
+  result.rowLeft = rowLeft;
   document.querySelectorAll('.project-picker').forEach(p => p.remove());
   exitSessionSelectMode();
   return result;
@@ -495,12 +519,25 @@ ROW_HEIGHTS_JS = """({alpha, beta}) => {
 
 def _row_heights(page, seed):
     """Row heights of both pickers on this page: (single, batch). The pickers are
-    opened directly: on a phone the sidebar is a drawer, and how a picker is
-    reached is the keyboard checks' business."""
+    opened directly, from a row that is on screen: how a picker is reached is the
+    keyboard checks' business."""
     result = page.evaluate(ROW_HEIGHTS_JS, seed)
     if result.get("problem"):
         return None, None, result["problem"]
+    if result["rowLeft"] < 0:
+        # A picker anchored on a row that is off screen is not what a person
+        # opens, and a picker that follows its anchor would be torn down there.
+        return None, None, f"the conversation's row is off screen (x={result['rowLeft']}): is the drawer closed?"
     return result["single"], result["batch"], None
+
+
+def _open_mobile_drawer(page):
+    """On a phone the sidebar is a drawer, closed at first, with its rows off screen."""
+    page.evaluate(
+        "() => { if (typeof toggleMobileSidebar === 'function'"
+        " && !document.querySelector('.sidebar.mobile-open')) toggleMobileSidebar(); }"
+    )
+    page.wait_for_timeout(400)
 
 
 def _check_heights(page, seed, *, coarse):
@@ -588,11 +625,13 @@ ROW_IN_BOX_JS = """() => {
   const picker = document.querySelector('.project-picker:not(.batch-project-picker)');
   const row = document.activeElement;
   if (!picker || !row || !picker.contains(row)) return {problem: 'focus is not on a picker row'};
-  const box = picker.getBoundingClientRect();
+  // The box inside the picker's border: a row on the border has its focus ring clipped.
+  const top = picker.getBoundingClientRect().top + picker.clientTop;
+  const bottom = top + picker.clientHeight;
   const rect = row.getBoundingClientRect();
   return {
     text: row.textContent.trim(),
-    inside: rect.top >= box.top - 1 && rect.bottom <= box.bottom + 1,
+    inside: rect.top >= top - 0.5 && rect.bottom <= bottom + 0.5,
     scrolls: picker.scrollHeight > picker.clientHeight + 1,
   };
 }"""
@@ -637,12 +676,7 @@ def _screenshots(browser, directory, seed):
             continue
         page.evaluate("() => { setLocale('de'); if (typeof applyLocaleToDOM === 'function') applyLocaleToDOM(); }")
         if mobile:
-            # The sidebar is a drawer on a phone.
-            page.evaluate(
-                "() => { if (typeof toggleMobileSidebar === 'function'"
-                " && !document.querySelector('.sidebar.mobile-open')) toggleMobileSidebar(); }"
-            )
-            page.wait_for_timeout(400)
+            _open_mobile_drawer(page)
         page.evaluate("renderSessionList()")
         page.wait_for_timeout(600)
         # On a phone the ⋮ menu opens from a long press on the row, so the row
@@ -741,6 +775,7 @@ def main():
             if page is None:
                 failures.append(f"  [touch] {errors}")
             else:
+                _open_mobile_drawer(page)
                 page.evaluate("renderSessionList()")
                 page.wait_for_timeout(500)
                 found = _check_heights(page, seed, coarse=True)
