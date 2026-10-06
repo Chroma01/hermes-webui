@@ -134,6 +134,20 @@ the first message typed with no conversation open must be sent; each reads the
 session list once before that, and shows the new row once the list is released
 (#7936, #7996, #8004). Run it locally with `python tests/browser_new_chat_focus.py`.
 
+It also runs `tests/browser_project_picker_keyboard.py`, which imports two
+conversations and creates three projects through the API and then drives both
+"Move to project" pickers. The single-conversation picker is opened from the ⋮
+menu with the keyboard: its rows must be buttons in a menu, focus must open on
+the conversation's current project, ArrowDown/ArrowUp must wrap and Home/End
+jump, Escape must close it and return focus to the conversation's ⋮ trigger
+(also after a sidebar repaint replaced that trigger), and Enter, Space and a
+click must each send the move. The batch picker must open on its first row and
+return focus to the selection bar's Move button. "No project" and "+ New
+project" must follow the interface language, and in a touch context every row
+must be at least 44px tall (#8044). Run it locally with
+`python tests/browser_project_picker_keyboard.py`; add `--screenshots DIR` to
+write the open picker at 390x844, 844x390 and 1440x900.
+
 ## Public conversation lifecycle gate
 
 `tests/browser_conversation_lifecycle.py` adds a public deterministic
