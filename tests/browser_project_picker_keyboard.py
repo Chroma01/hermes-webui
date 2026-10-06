@@ -38,17 +38,27 @@ WHAT IT CHECKS
   rows under a coarse pointer (a touch context, 390x844, the sidebar drawer open)
   - every row of both pickers is at least 44px tall; with a mouse they keep
     their compact height.
+  a long list of conversations (forty more) and the fifteen projects
+  - with a mouse, a wheel over the open batch picker scrolls the conversation
+    list: the picker sits in that list and must not take the scroll;
+  - on a phone upright, a small phone and a phone on its side (390x844,
+    375x667, 844x390, touch), the single picker opened from the first, middle
+    and last conversation on screen lets every row be tapped, scrolling inside
+    itself where they do not fit; the batch picker stays within its cap,
+    scrolls inside it, and every row can be tapped.
 
 SCOPE
   Agent-free, like tests/browser_smoke.py: the real server.py on an ephemeral
   port with isolated temp state. Conversations are imported and projects created
-  through the public API. Where the picker sits on screen is not checked here.
+  through the public API. Which side of its anchor the picker opens on is not
+  checked here, only that its rows can be reached.
 
 USAGE
   python tests/browser_project_picker_keyboard.py
   python tests/browser_project_picker_keyboard.py --screenshots DIR
-      also writes the open single-conversation picker at 390x844, 844x390 and
-      1440x900 (many projects, long names, German) into DIR.
+      also writes the single-conversation picker, opened from the middle of
+      the list, at 390x844, 820x1180, 844x390 and 1440x900 (many projects, long
+      names, German) into DIR.
   (Requires: playwright + chromium.)
 
 EXIT CODES
@@ -663,10 +673,195 @@ def _check_long_list(page, seed):
     return failures
 
 
-def _screenshots(browser, directory, seed):
-    """The open picker with many projects and long names, in German."""
+MANY_CONVERSATIONS = 40
+# A phone upright, a small phone, and a phone on its side.
+PHONE_VIEWPORTS = ((390, 844), (375, 667), (844, 390))
+
+SEED_MANY_JS = """async (count) => {
+  const messages = [
+    {role: 'user', content: 'hello'},
+    {role: 'assistant', content: 'hello back'},
+  ];
+  for (let n = 1; n <= count; n++) {
+    const response = await fetch('/api/session/import', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({title: 'Filler conversation ' + n, messages}),
+    });
+    if (!response.ok) throw new Error('import failed: ' + response.status);
+  }
+  await renderSessionList();
+}"""
+
+# Scrolls the list alone, so the first conversation is at its top. On a phone on
+# its side the conversations start below the list's fold.
+FIRST_CONVERSATION_TO_TOP_JS = """() => {
+  const list = document.getElementById('sessionList');
+  const row = list && list.querySelector('.session-item[data-sid]');
+  if (row) list.scrollTop += row.getBoundingClientRect().top - list.getBoundingClientRect().top;
+}"""
+
+# The conversations whose rows are wholly on screen, top to bottom.
+VISIBLE_ROWS_JS = """() => Array.from(document.querySelectorAll('#sessionList .session-item[data-sid]'))
+  .filter(row => { const r = row.getBoundingClientRect(); return r.top >= 0 && r.bottom <= innerHeight && r.left >= 0; })
+  .sort((a, b) => a.getBoundingClientRect().top - b.getBoundingClientRect().top)
+  .map(row => row.dataset.sid)"""
+
+# Opens the picker from a conversation's row, as a long press does on a phone,
+# and asks of every row: once scrolled to inside the picker, is it under a finger?
+REACHABLE_JS = """(sid) => {
+  const row = document.querySelector('.session-item[data-sid="' + sid + '"]');
+  const session = _allSessions.find(s => s && s.session_id === sid);
+  if (!row || !session) return {problem: 'the conversation has no sidebar row'};
+  const anchorTop = Math.round(row.getBoundingClientRect().top);
+  _showProjectPicker(session, row);
+  const picker = document.querySelector('.project-picker:not(.batch-project-picker)');
+  if (!picker) return {problem: 'the picker did not open'};
+  const unreachable = [];
+  const items = Array.from(picker.querySelectorAll('.project-picker-item'));
+  for (const item of items) {
+    item.scrollIntoView({block: 'nearest'});
+    const rect = item.getBoundingClientRect();
+    const hit = document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
+    if (!hit || !(hit === item || item.contains(hit)))
+      unreachable.push(item.textContent.trim() + ' (y=' + Math.round(rect.top) + '..' + Math.round(rect.bottom) + ')');
+  }
+  const box = picker.getBoundingClientRect();
+  return {
+    anchorTop, rows: items.length, unreachable,
+    top: Math.round(box.top), bottom: Math.round(box.bottom), viewport: innerHeight,
+  };
+}"""
+
+
+def _check_phone_geometry(page, size):
+    """On a phone, with a screenful of conversations and 15 projects, every row of
+    the picker can be tapped wherever in the list it was opened."""
+    page.evaluate(FIRST_CONVERSATION_TO_TOP_JS)
+    page.wait_for_timeout(200)
+    visible = page.evaluate(VISIBLE_ROWS_JS)
+    if len(visible) < 3:
+        return [f"  [phone {size}] only {len(visible)} conversations are on screen: is the drawer open?"]
+    failures = []
+    anchors = (("first", visible[0]), ("middle", visible[len(visible) // 2]), ("last", visible[-1]))
+    for where, sid in anchors:
+        state = page.evaluate(REACHABLE_JS, sid)
+        if state.get("problem"):
+            failures.append(f"  [phone {size}] {where} conversation: {state['problem']}")
+            continue
+        if state["rows"] < 10:
+            failures.append(f"  [phone {size}] the picker has only {state['rows']} rows: the long list was not seeded")
+        if state["unreachable"]:
+            failures.append(
+                f"  [phone {size}] opened from the {where} conversation on screen (y={state['anchorTop']}), the picker spans"
+                f" y={state['top']}..{state['bottom']} of {state['viewport']} and"
+                f" {len(state['unreachable'])} of {state['rows']} rows cannot be tapped: {state['unreachable']}"
+            )
+        page.keyboard.press("Escape")
+        if not _wait_until(page, f"!document.querySelector('{SINGLE}')", 1500):
+            failures.append(f"  [phone {size}] the picker opened from the {where} conversation did not close on Escape")
+            page.evaluate("document.querySelectorAll('.project-picker').forEach(p => p.remove())")
+    return failures
+
+
+# Opens the batch picker for two conversations and measures it in one step: a
+# background sidebar refresh rebuilds the selection bar at any time.
+BATCH_ON_TOUCH_JS = """({alpha, beta}) => {
+  if (!_sessionSelectMode) toggleSessionSelectMode();
+  setSessionSelected(alpha, true);
+  setSessionSelected(beta, true);
+  const button = Array.from(document.querySelectorAll('#batchActionBar .batch-action-btn'))
+    .find(btn => btn.textContent.trim() === t('session_batch_move'));
+  if (!button) return {problem: 'the selection bar has no Move button'};
+  _showBatchProjectPicker(button);
+  const picker = document.querySelector('.batch-project-picker');
+  if (!picker) return {problem: 'the batch picker did not open'};
+  const unreachable = [];
+  const spilled = [];
+  const items = Array.from(picker.querySelectorAll('.project-picker-item'));
+  for (const item of items) {
+    item.scrollIntoView({block: 'nearest'});
+    const rect = item.getBoundingClientRect();
+    const hit = document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
+    if (!hit || !(hit === item || item.contains(hit))) unreachable.push(item.textContent.trim());
+    // A cap that does not clip lets the rows run on over the conversations below.
+    const box = picker.getBoundingClientRect();
+    if (rect.top < box.top - 0.5 || rect.bottom > box.bottom + 0.5) spilled.push(item.textContent.trim());
+  }
+  const result = {
+    rows: items.length, unreachable, spilled,
+    height: Math.round(picker.getBoundingClientRect().height),
+    content: picker.scrollHeight,
+    scrolls: picker.scrollHeight > picker.clientHeight + 1,
+  };
+  picker.remove();
+  exitSessionSelectMode();
+  return result;
+}"""
+# About five and a half 44px rows: the cap the stylesheet gives the batch picker.
+BATCH_TOUCH_CAP_PX = 250
+
+
+def _check_batch_on_touch(page, size):
+    """In the selection bar on a phone, a long project list scrolls inside a cap
+    instead of pushing the chosen conversations off screen."""
+    visible = page.evaluate(VISIBLE_ROWS_JS)
+    if len(visible) < 2:
+        return [f"  [phone {size}] fewer than two conversations are on screen for the batch picker"]
+    state = page.evaluate(BATCH_ON_TOUCH_JS, {"alpha": visible[0], "beta": visible[1]})
+    if state.get("problem"):
+        return [f"  [phone {size}] batch picker: {state['problem']}"]
+    failures = []
+    if state["content"] <= BATCH_TOUCH_CAP_PX:
+        failures.append(f"  [phone {size}] the batch picker's {state['rows']} rows fit its cap: the long list was not seeded")
+    if state["height"] > BATCH_TOUCH_CAP_PX + 2:
+        failures.append(f"  [phone {size}] the batch picker is {state['height']}px tall, over its {BATCH_TOUCH_CAP_PX}px cap")
+    if not state["scrolls"]:
+        failures.append(f"  [phone {size}] the capped batch picker does not scroll inside itself")
+    if state["unreachable"]:
+        failures.append(f"  [phone {size}] batch picker rows that cannot be tapped: {state['unreachable']}")
+    if state["spilled"]:
+        failures.append(f"  [phone {size}] batch picker rows shown outside its box: {state['spilled']}")
+    return failures
+
+
+def _check_batch_wheel(page):
+    """A mouse wheel over the open batch picker still scrolls the conversation list."""
+    visible = page.evaluate(VISIBLE_ROWS_JS)
+    if len(visible) < 2:
+        return ["  [wheel] fewer than two conversations are on screen"]
+    scrollable = page.evaluate(
+        "(() => { const list = document.getElementById('sessionList');"
+        " return !!list && list.scrollHeight > list.clientHeight + 200; })()"
+    )
+    if not scrollable:
+        return ["  [wheel] the conversation list does not scroll: too few conversations were seeded"]
+    problem = _open_batch_picker(page, {"alpha": visible[0], "beta": visible[1]})
+    if problem:
+        return [f"  [wheel] {problem}"]
+    box = page.evaluate(
+        f"(() => {{ const r = document.querySelector('{BATCH}').getBoundingClientRect();"
+        " return {x: r.left + r.width / 2, y: r.top + r.height / 2}; })()"
+    )
+    before = page.evaluate("document.getElementById('sessionList').scrollTop")
+    page.mouse.move(box["x"], box["y"])
+    for _tick in range(3):
+        page.mouse.wheel(0, 100)
+        page.wait_for_timeout(120)
+    page.wait_for_timeout(300)
+    after = page.evaluate("document.getElementById('sessionList').scrollTop")
+    page.evaluate("() => { document.querySelectorAll('.project-picker').forEach(p => p.remove()); exitSessionSelectMode(); }")
+    if after - before < 100:
+        return [
+            f"  [wheel] three wheel ticks over the batch picker moved the conversation list by {after - before}px"
+        ]
+    return []
+
+
+def _screenshots(browser, directory):
+    """The picker opened from the middle of a long conversation list, with many
+    projects and long names, in German."""
     os.makedirs(directory, exist_ok=True)
-    for width, height in ((390, 844), (844, 390), (1440, 900)):
+    for width, height in ((390, 844), (820, 1180), (844, 390), (1440, 900)):
         mobile = width < 1000
         ctx, page, errors = _new_page(
             browser, viewport={"width": width, "height": height}, has_touch=mobile, is_mobile=mobile
@@ -679,6 +874,13 @@ def _screenshots(browser, directory, seed):
             _open_mobile_drawer(page)
         page.evaluate("renderSessionList()")
         page.wait_for_timeout(600)
+        page.evaluate(FIRST_CONVERSATION_TO_TOP_JS)
+        page.wait_for_timeout(200)
+        visible = page.evaluate(VISIBLE_ROWS_JS)
+        if not visible:
+            print(f"screenshot {width}x{height}: no conversation is on screen", file=sys.stderr)
+            ctx.close()
+            continue
         # On a phone the ⋮ menu opens from a long press on the row, so the row
         # is the anchor there; with a mouse it is the row's ⋮ trigger.
         opened = page.evaluate(
@@ -690,7 +892,7 @@ def _screenshots(browser, directory, seed):
               _showProjectPicker(session, anchor);
               return !!document.querySelector('.project-picker');
             }""",
-            {"sid": seed["alpha"], "mobile": mobile},
+            {"sid": visible[len(visible) // 2], "mobile": mobile},
         )
         page.wait_for_timeout(300)
         path = os.path.join(directory, f"picker-{width}x{height}.png")
@@ -812,8 +1014,43 @@ def main():
                 failures.extend(f"  [long list] pageerror: {err}" for err in errors)
                 ctx.close()
 
+            # From here on the server holds 15 projects; add a list of
+            # conversations longer than any screen.
+            ctx, page, errors = _new_page(browser, viewport={"width": 1440, "height": 900})
+            if page is None:
+                failures.append(f"  [wheel] {errors}")
+            else:
+                page.evaluate(SEED_MANY_JS, MANY_CONVERSATIONS)
+                page.wait_for_timeout(SETTLE_MS)
+                found = _check_batch_wheel(page)
+                failures.extend(found)
+                if not found:
+                    print("OK  wheel — the list scrolls with the pointer over the batch picker")
+                failures.extend(f"  [wheel] pageerror: {err}" for err in errors)
+                ctx.close()
+
+            for width, height in PHONE_VIEWPORTS:
+                size = f"{width}x{height}"
+                ctx, page, errors = _new_page(
+                    browser, viewport={"width": width, "height": height}, has_touch=True, is_mobile=True
+                )
+                if page is None:
+                    failures.append(f"  [phone {size}] {errors}")
+                    continue
+                _open_mobile_drawer(page)
+                page.evaluate("renderSessionList()")
+                page.wait_for_timeout(SETTLE_MS)
+                found = _check_phone_geometry(page, size)
+                page.wait_for_timeout(SETTLE_MS)
+                found += _check_batch_on_touch(page, size)
+                failures.extend(found)
+                if not found:
+                    print(f"OK  phone {size} — every row can be tapped: single picker from the top, middle and bottom, batch picker capped")
+                failures.extend(f"  [phone {size}] pageerror: {err}" for err in errors)
+                ctx.close()
+
             if shots:
-                _screenshots(browser, shots, seed)
+                _screenshots(browser, shots)
             browser.close()
 
         if failures:

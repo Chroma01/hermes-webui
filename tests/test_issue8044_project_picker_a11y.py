@@ -13,6 +13,7 @@ pickers in a real browser are tests/browser_project_picker_keyboard.py.
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 from pathlib import Path
 
@@ -447,9 +448,23 @@ def test_a_row_is_a_finger_tall_on_a_touch_screen():
 
 def test_taller_rows_scroll_inside_the_picker():
     """44px rows make a long project list taller than a phone's screen."""
-    rule = _between(STYLE_CSS, ".project-picker{max-height:", "}")
+    rule = _between(STYLE_CSS, ".project-picker:not(.batch-project-picker){max-height:", "}")
     assert "calc(100dvh - 16px)" in rule
     assert "overflow-y:auto" in rule
+
+
+def test_the_inline_batch_picker_does_not_take_the_scroll_box():
+    """The batch picker sits in the conversation list. As a scroll box with
+    `overscroll-behavior:contain` it swallowed the wheel and the list stood still."""
+    assert ".project-picker{max-height:" not in STYLE_CSS
+    rules = re.findall(r"([^{}]+)\{([^{}]*)\}", STYLE_CSS)
+    batch = [
+        body
+        for selector, body in rules
+        if ".batch-project-picker" in selector and ":not(.batch-project-picker)" not in selector
+    ]
+    assert len(batch) >= 2
+    assert not any("overscroll-behavior" in body for body in batch)
 
 
 def test_a_focused_row_can_be_seen():
@@ -477,7 +492,7 @@ def test_touch_batch_picker_is_capped_so_selected_rows_stay_visible():
     """Fable UX gate (2026-10-06): the inline batch picker's 44px touch rows would push the checked
     conversations off screen; on coarse pointers it scrolls inside a ~5.5-row cap."""
     css = (Path(__file__).resolve().parent.parent / "static" / "style.css").read_text(encoding="utf-8")
-    assert "@media (pointer:coarse){.batch-action-bar .batch-project-picker{max-height:250px;}}" in css
+    assert "@media (pointer:coarse){.batch-action-bar .batch-project-picker{max-height:250px;overflow-y:auto;}}" in css
 
 
 def test_single_picker_height_is_clamped_to_the_viewport_room():

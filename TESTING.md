@@ -146,10 +146,14 @@ trigger of its own), and Enter, Space and a click must each send the move. The
 batch picker must open on its first row and return focus to the selection
 bar's Move button. "No project" and "+ New project" must follow the interface
 language; in a touch context, with the drawer open, every row must be at least
-44px tall; and in a long list the focused row must be inside the picker's box
-(#8044). Run it locally with
+44px tall; and in a long list the focused row must be inside the picker's box.
+With forty more conversations and fifteen projects, a mouse wheel over the open
+batch picker must still scroll the conversation list, and on three phone sizes
+every row of the single picker must be tappable wherever in the list it was
+opened, with the batch picker scrolling inside its cap (#8044). Run it locally
+with
 `python tests/browser_project_picker_keyboard.py`; add `--screenshots DIR` to
-write the open picker at 390x844, 844x390 and 1440x900.
+write the open picker at 390x844, 820x1180, 844x390 and 1440x900.
 
 ## Public conversation lifecycle gate
 
