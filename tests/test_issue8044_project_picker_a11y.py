@@ -471,3 +471,10 @@ def test_the_button_keeps_the_rows_look():
         assert declaration in rule, declaration
     assert STYLE_CSS.index(reset) < STYLE_CSS.index(".project-picker-item{padding:")
     assert STYLE_CSS.index(reset) < STYLE_CSS.index(".project-picker-create{")
+
+
+def test_touch_batch_picker_is_capped_so_selected_rows_stay_visible():
+    """Fable UX gate (2026-10-06): the inline batch picker's 44px touch rows would push the checked
+    conversations off screen; on coarse pointers it scrolls inside a ~5.5-row cap."""
+    css = (Path(__file__).resolve().parent.parent / "static" / "style.css").read_text(encoding="utf-8")
+    assert "@media (pointer:coarse){.batch-action-bar .batch-project-picker{max-height:250px;}}" in css
