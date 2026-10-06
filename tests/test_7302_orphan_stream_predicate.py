@@ -69,6 +69,23 @@ def _register_worker_less_stream():
     config.register_stream_owner(STREAM_ID, SESSION_ID)
 
 
+def _register_launching_stream():
+    """Register a stream that is STILL LAUNCHING: owner + launch-phase claim.
+
+    This is the real publication window. Every registration edge publishes the
+    claim inside the SAME ``STREAMS_LOCK`` critical section that creates the
+    ``STREAMS`` entry (api/routes.py, #7302 finding 5), so the worker-less,
+    claim-less shape above is only reachable in production when a worker died
+    before admission. Returns the claim token so the caller can retire it.
+    """
+    with config.STREAMS_LOCK:
+        config.STREAMS[STREAM_ID] = config.create_stream_channel()
+        config.publish_pre_admission_claim(STREAM_ID, streams_lock_held=True)
+        claim_token = config.PRE_ADMISSION_CLAIMS[STREAM_ID]
+    config.register_stream_owner(STREAM_ID, SESSION_ID)
+    return claim_token
+
+
 def _drive_reaper_until(predicate, timeout: float = 3.0, interval: float = 0.02):
     """Run the REAL ``_reaper_loop`` in a thread until ``predicate()`` holds."""
     original = bp._REAPER_INTERVAL_SECS
@@ -88,29 +105,71 @@ def _drive_reaper_until(predicate, timeout: float = 3.0, interval: float = 0.02)
 
 
 def test_a_published_stream_keeps_the_session_busy_for_the_pre_check():
-    """A registered stream reads busy even before a worker row exists.
+    """A stream in its publication window reads busy before a worker row exists.
 
     ``_session_has_active_turn()`` is the pre-check sibling completions run
     against, and it only DEFERS: it never claims and never spends a delivery
     attempt. Upstream pins that contract
     (tests/test_async_delegation_webui_bridge.py::
     test_busy_predicate_covers_stream_publication_window_before_active_runs), so the
-    published-stream window must read busy. The orphan itself is reclaimed by the
-    channel reaper and cleared by the chat/start orphan path (see below).
+    published-stream window must read busy. The window is modeled with its
+    launch-phase claim, which every registration edge publishes on the same
+    ``STREAMS_LOCK`` edge as the entry (api/routes.py, finding 5): that claim --
+    not bare ``STREAMS`` membership -- is what keeps a launching stream alive.
+    The orphan itself is reclaimed by the channel reaper and cleared by the
+    chat/start orphan path (see below).
     """
-    _register_worker_less_stream()
+    claim_token = _register_launching_stream()
 
     assert bp._session_has_active_turn(SESSION_ID) is True, (
         "the publication window must defer sibling completions instead of letting "
         "them claim against a stream that may still be live"
     )
 
-    # Control: a live worker row still counts as busy.
+    # The worker is admitted: the claim retires and its ACTIVE_RUNS row takes over
+    # as the liveness signal. Control: that row still counts as busy.
+    config.retire_pre_admission_claim_if_owned(STREAM_ID, claim_token=claim_token)
     config.register_active_run(
         STREAM_ID, session_id=SESSION_ID, started_at=time.time(), phase="starting"
     )
     assert bp._session_has_active_turn(SESSION_ID) is True, (
         "a live worker row must still make the session busy"
+    )
+
+
+def test_an_orphaned_stream_does_not_defer_sibling_completions():
+    """A stream whose worker died before admission must NOT read busy.
+
+    Re-gate regression (greptile P2, 06-oct): ``_session_has_active_turn()``
+    counted any same-session ``STREAMS`` entry as an active turn, so a stream left
+    behind by a worker that died before admission kept the session looking busy. A
+    sibling async-delegation completion then deferred against a stream nobody
+    owns -- until the channel reaper's sweep happened to collect it (its interval
+    is ``_REAPER_INTERVAL_SECS``, 60 s). The pre-check only DEFERS: it never claims
+    and never spends a delivery attempt, so the whole cost is that latency, and it
+    is avoidable -- the shared predicate already names this shape.
+    """
+    _register_worker_less_stream()
+
+    assert config.is_orphaned_stream(STREAM_ID) is True, (
+        "registered + owner + no worker + no claim is the orphan shape"
+    )
+    assert bp._session_has_active_turn(SESSION_ID) is False, (
+        "an orphaned stream must not defer a sibling completion until the reaper's "
+        "sweep happens to collect it"
+    )
+
+    # Control: the SAME shape with its launch-phase claim alive is the real
+    # publication window and must keep deferring -- the fix must not reopen
+    # finding 5 (reaping a stream that is still launching).
+    token = config.publish_pre_admission_claim(STREAM_ID)
+    assert bp._session_has_active_turn(SESSION_ID) is True, (
+        "a launching stream lost its busy reading: a sibling completion would claim "
+        "against a worker that is about to admit itself"
+    )
+    config.retire_pre_admission_claim_if_owned(STREAM_ID, claim_token=token)
+    assert bp._session_has_active_turn(SESSION_ID) is False, (
+        "retiring the claim with no worker row left must return to idle"
     )
 
 
