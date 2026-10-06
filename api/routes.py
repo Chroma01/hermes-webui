@@ -24404,24 +24404,15 @@ def _active_stream_blocks_chat_start(session, stream_id: str | None) -> bool:
             # claim, and no pending turn inside its registration window. The claim
             # check is what keeps a stream that is still launching alive whatever
             # the pending age (finding 5).
-            try:
-                _orphan = is_orphaned_stream(
-                    stream_id,
-                    pending_turn_in_window=_pending_turn_in_registration_window(session),
-                    streams_lock_held=True,
-                )
-            except Exception:
-                # Unknown liveness is NOT an orphan: if the worker registry cannot
-                # be read, fail CLOSED and keep blocking — a False here would clear
-                # a stream whose owner we cannot even inspect.
-                logger.warning(
-                    "chat/start: liveness registry unreadable for stream %s — "
-                    "failing closed",
-                    stream_id,
-                    exc_info=True,
-                )
-                return True
-            if not _orphan:
+            # The predicate fails CLOSED on its own when the worker registry cannot
+            # be read (api.config._is_orphaned_stream_locked returns False for an
+            # unreadable ACTIVE_RUNS), so no second guard belongs here: one
+            # definition, one owner. A local try/except would be unreachable.
+            if not is_orphaned_stream(
+                stream_id,
+                pending_turn_in_window=_pending_turn_in_registration_window(session),
+                streams_lock_held=True,
+            ):
                 return True
             # Confirmed orphan. Clear the WHOLE stream-owned state, not just the
             # registry entry: a crashed or wedged worker never reaches its own
