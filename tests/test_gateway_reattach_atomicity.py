@@ -19,7 +19,6 @@ launch. These tests pin the invariant and its observable consequence.
 Grep for the assertions, not for source strings: nothing here reads the source text.
 """
 import queue
-import threading
 import time
 
 import pytest
