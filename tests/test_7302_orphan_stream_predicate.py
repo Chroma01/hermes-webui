@@ -87,19 +87,22 @@ def _drive_reaper_until(predicate, timeout: float = 3.0, interval: float = 0.02)
         del started  # only recorded for symmetry with the start/stop pairing
 
 
-def test_an_orphaned_stream_does_not_keep_the_session_busy():
-    """A worker-less STREAMS entry is not a live turn for the busy pre-check.
+def test_a_published_stream_keeps_the_session_busy_for_the_pre_check():
+    """A registered stream reads busy even before a worker row exists.
 
     ``_session_has_active_turn()`` is the pre-check sibling completions run
-    against. Trusting ``STREAMS`` membership made an orphaned stream keep the
-    session busy forever, so those completions were refused against a stream with
-    no worker at all.
+    against, and it only DEFERS: it never claims and never spends a delivery
+    attempt. Upstream pins that contract
+    (tests/test_async_delegation_webui_bridge.py::
+    test_busy_predicate_covers_stream_publication_window_before_active_runs), so the
+    published-stream window must read busy. The orphan itself is reclaimed by the
+    channel reaper and cleared by the chat/start orphan path (see below).
     """
     _register_worker_less_stream()
 
-    assert bp._session_has_active_turn(SESSION_ID) is False, (
-        "an orphaned stream kept the session reporting busy: sibling completions "
-        "are refused against a stream that has no worker"
+    assert bp._session_has_active_turn(SESSION_ID) is True, (
+        "the publication window must defer sibling completions instead of letting "
+        "them claim against a stream that may still be live"
     )
 
     # Control: a live worker row still counts as busy.

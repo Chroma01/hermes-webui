@@ -318,6 +318,10 @@ def test_orphan_clear_keeps_the_lifecycle_lock_order(monkeypatch):
     )
     monkeypatch.setattr(routes, "STREAMS_LOCK", probe.wrap("STREAMS_LOCK"))
     monkeypatch.setattr(routes, "ACTIVE_RUNS_LOCK", probe.wrap("ACTIVE_RUNS_LOCK"))
+    # _is_orphaned_stream_locked resolves the worker-registry lock from api.config at
+    # call time, so that binding must be wrapped too or the acquire never lands in
+    # the recorded order (the order assertion below is the point of this test).
+    monkeypatch.setattr(config, "ACTIVE_RUNS_LOCK", probe.wrap("ACTIVE_RUNS_LOCK"))
     # unregister_stream_owner resolves the owner lock from api.config at call time.
     monkeypatch.setattr(
         config, "STREAM_SESSION_OWNERS_LOCK", probe.wrap("STREAM_SESSION_OWNERS_LOCK")

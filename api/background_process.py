@@ -2182,15 +2182,13 @@ def _session_has_active_turn(session_id: str) -> bool:
     for _stream_id in live_stream_ids:
         if str(stream_owners.get(_stream_id) or "") != str(session_id or ""):
             continue
-        # A stale entry is not a live turn. Counting STREAMS membership alone made
-        # an orphaned stream keep the session looking busy forever, so sibling
-        # async-delegation completions were refused against a stream with no
-        # worker (re-gate finding 2). Ask the shared orphan predicate instead.
-        # ``pending_turn_in_window`` stays False here: the launch-phase claim
-        # already covers the registration-to-admission gap, and an unclaimed,
-        # worker-less stream is exactly what the predicate is meant to catch.
-        if not _cfg.is_orphaned_stream(_stream_id):
-            return True
+        # The publication window counts as BUSY (upstream contract, #6959 gate):
+        # this pre-check only DEFERS a sibling completion — it never claims and
+        # never spends a delivery attempt — so deferring on a published stream is
+        # the safe side. A stream left behind by a wedged worker is reclaimed by
+        # the channel reaper and cleared by the chat/start orphan path
+        # (``_active_stream_blocks_chat_start``), not by this pre-check.
+        return True
     return False
 
 
