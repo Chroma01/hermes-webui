@@ -2149,7 +2149,12 @@ def _session_has_active_turn(session_id: str) -> bool:
     synchronously-populated STREAM_SESSION_OWNERS registry): the worker
     publishes its stream BEFORE it registers in ACTIVE_RUNS, and that
     pre-registration window must not look idle to a sibling completion
-    (#6959 gate — see the STREAMS check below). ``_start_chat_stream_for_session``'s
+    (#6959 gate — see the STREAMS check below). For how long that entry counts,
+    ask ``api.config.is_orphaned_stream()``: it stays busy while it is still
+    launching (its ``PRE_ADMISSION_CLAIMS`` claim) or worker-backed, and a
+    worker-less, claim-less entry — a turn that died before admission — reads
+    idle, so an orphan cannot defer a sibling completion until the reaper's
+    sweep. ``_start_chat_stream_for_session``'s
     own active-stream guard remains the authoritative 409 backstop for any
     residual race.
     """
@@ -2182,13 +2187,22 @@ def _session_has_active_turn(session_id: str) -> bool:
     for _stream_id in live_stream_ids:
         if str(stream_owners.get(_stream_id) or "") != str(session_id or ""):
             continue
-        # The publication window counts as BUSY (upstream contract, #6959 gate):
-        # this pre-check only DEFERS a sibling completion — it never claims and
-        # never spends a delivery attempt — so deferring on a published stream is
-        # the safe side. A stream left behind by a wedged worker is reclaimed by
-        # the channel reaper and cleared by the chat/start orphan path
-        # (``_active_stream_blocks_chat_start``), not by this pre-check.
-        return True
+        # A registered stream is BUSY while it is still launching OR owned by a
+        # live worker: membership alone is not liveness. The launch-phase claim
+        # covers the publication window (upstream contract, #6959 gate) and this
+        # pre-check only DEFERS a sibling completion — it never claims and never
+        # spends a delivery attempt — so deferring on a launching stream is the
+        # safe side. An entry left behind by a worker that died before admission
+        # has no claim and no ACTIVE_RUNS row, though: counting it busy kept the
+        # session looking active until the channel reaper's sweep collected the
+        # orphan, deferring an otherwise idle session's async-delegation wakeup by
+        # up to ``_REAPER_INTERVAL_SECS`` (greptile P2, 06-oct). Ask the ONE
+        # shared orphan predicate instead of reading membership here. This loop
+        # already runs outside STREAMS_LOCK (both registries were snapshotted
+        # above), so the locking wrapper is the right entry point; the chat/start
+        # orphan path and the reaper keep their own responsibilities.
+        if not _cfg.is_orphaned_stream(_stream_id):
+            return True
     return False
 
 
