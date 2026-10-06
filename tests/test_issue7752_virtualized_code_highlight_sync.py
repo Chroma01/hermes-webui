@@ -74,7 +74,15 @@ def test_restore_live_turn_html_runs_highlight_synchronously(ui_js_content):
     """restoreLiveTurnHtmlForSession must execute highlightCode and initTreeViews synchronously on restored node."""
     fn_idx = ui_js_content.find("function restoreLiveTurnHtmlForSession(sid){")
     assert fn_idx != -1, "restoreLiveTurnHtmlForSession not found in ui.js"
-    fn_slice = ui_js_content[fn_idx : fn_idx + 2500]
+    # A fatia vai até a próxima function de topo, nunca um limite fixo de chars:
+    # limite fixo quebra sozinho quando o master acrescenta linhas no TOPO da
+    # função alvo. Medido no #7912 — o fix do #6948 entrou com 12 linhas a mais
+    # (comentário + else-if) e a chamada passou de +1809 para +2540, estourando
+    # o `+ 2500` antigo. CI reproduziu em 3 versões de Python; local não via.
+    _prox = ui_js_content.find("\nfunction ", fn_idx + 1)
+    _teto = _prox if _prox != -1 else fn_idx + 60000
+    fn_slice = ui_js_content[fn_idx:_teto]
+    assert len(fn_slice) > 500, "restoreLiveTurnHtmlForSession slice came out too short"
 
     highlight_call = "if(typeof highlightCode==='function') highlightCode(restored);"
     tree_init_call = "if(typeof initTreeViews==='function') initTreeViews(restored);"
