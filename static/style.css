@@ -5306,7 +5306,7 @@ main.main > #mainPlugin{display:none;}
 .provider-quota-card-invalid_key .provider-quota-badge{background:color-mix(in srgb,var(--error) 12%,transparent);color:var(--error);}
 .provider-quota-card-invalid_key .provider-quota-body>.provider-quota-message{color:var(--error);}
 /* Body copy, not a badge: pull the warning hue toward the text colour so a light card keeps readable contrast. */
-.provider-quota-card-unavailable .provider-quota-body>.provider-quota-message{color:color-mix(in srgb,var(--warning) 55%,var(--text));}
+.provider-quota-card-unavailable:not(.provider-quota-card-neutral) .provider-quota-body>.provider-quota-message{color:color-mix(in srgb,var(--warning) 55%,var(--text));}
 @media (max-width: 520px){
   .provider-quota-card{padding:12px;}
   .provider-quota-header{flex-wrap:wrap;}

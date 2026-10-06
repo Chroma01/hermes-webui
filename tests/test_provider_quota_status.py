@@ -773,9 +773,12 @@ def test_quota_card_failure_message_is_coloured_by_state_and_takes_its_own_row()
     # Scoped to the card body: the cost chart's empty state reuses the class and is not a failure.
     assert ".provider-quota-card-invalid_key .provider-quota-body>.provider-quota-message{color:var(--error);}" in css
     assert (
-        ".provider-quota-card-unavailable .provider-quota-body>.provider-quota-message"
+        ".provider-quota-card-unavailable:not(.provider-quota-card-neutral) .provider-quota-body>.provider-quota-message"
         "{color:color-mix(in srgb,var(--warning) 55%,var(--text));}"
     ) in css
+    # "No active provider is configured." is neutral, not a failure: the card is tagged and stays muted.
+    js = (ROOT / "static" / "panels.js").read_text(encoding="utf-8")
+    assert "if(!status.provider) card.classList.add('provider-quota-card-neutral');" in js
     assert not re.search(r"provider-quota-card-\w+ \.provider-quota-message\{", css)
     assert ".provider-quota-body>.provider-quota-message{width:100%;}" in css
 
