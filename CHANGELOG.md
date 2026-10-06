@@ -114,6 +114,49 @@
 
 ### Fixed
 
+- **Links next to Chinese/Japanese punctuation end in the right place, and internationalized domains stay whole.** A URL
+  followed by full-width punctuation (`，`, `）`, `。`, opening brackets and quotes) now ends before it, so the prose after
+  it is no longer pulled into the link, while hosts written with the full-width dots (`https://例子。中国`,
+  `https://www。例子.com`, `https://example。рф`, labels with Indic or Thai vowel signs) still link whole and `．`/`｡`
+  inside a path or query no longer cut it short. Long runs of adjacent URLs still render in linear time. Thanks
+  @pxxD1998. (#7979 by @pxxD1998)
+
+- **CLI conversations no longer vanish from the sidebar when a read fails partway.** A read-only `projects.json`
+  (for example after a Docker UID mismatch), a locked `state.db` during the cron, webhook, kanban, project-recovery or
+  refill reads, or one unavailable profile in the all-profiles view used to throw away every row already loaded, so the
+  CLI sidebar went empty and stayed empty on every poll. Those failures now keep the rows that were read, mark the
+  result incomplete so it isn't cached, and the warning names the profile and database instead of blaming
+  `state.db`. Thanks @martindell. (#7555 by @martindell)
+
+- **Deleting your last conversation resets the model picker to your configured default.** The empty composer used to
+  keep showing the deleted conversation's model even though the next chat starts on the default, so the picker and the
+  model actually used disagreed. Single and batch delete both reset it, and a model you pick while the delete is still
+  in flight is kept. Thanks @MoBluey. (#7324 by @MoBluey)
+
+- **The model picker no longer lists a slash-named model twice under a plugin provider.** With an active provider such
+  as Command Code and a configured model id that itself contains a slash (`deepseek/deepseek-v4-flash`), the
+  `provider/model` spelling no longer becomes a second row; each provider keeps its own row, so another provider's
+  `model-a` is never hidden behind a badge-owned one. Thanks @webtecnica. (#7292 by @webtecnica, fixes #7290)
+
+- **Renaming a conversation, project or file no longer triggers the browser's or a password manager's login
+  autofill.** Every rename and naming field (sidebar and titlebar conversation rename, project create and rename,
+  workspace file rename) is marked as a non-credential input, so Chrome and 1Password/LastPass/Bitwarden stop offering
+  saved logins in it. Thanks @happy5318. (#7689 by @happy5318, fixes #7542)
+
+- **A dead model endpoint no longer hides your other custom providers from the model picker.** The cold model
+  catalog shares its time budget fairly across custom-provider probes: an unreachable endpoint can't use up the whole
+  window, and a healthy slow gateway appears on the first picker load whatever its position in the configuration.
+  Healthy results are cached for the next load, and a probe that ran out of time is retried rather than remembered as
+  unreachable. Thanks @HarukiTakehata. (#7506 by @HarukiTakehata, refs #7481)
+
+- **Docker installs on the Experimental channel now get the update notice.** Docker images have no `.git`, so their
+  update check falls back to comparing the baked version with published release tags, and that fallback only knew
+  stable `v*` tags: an `:experimental` image never saw a newer `exp-v*` release. The check is now channel-aware: it
+  reads `exp-v*` tags for the Experimental channel (paginated, with a page cap; release candidates and suffixed tags are
+  ignored), also counts the experimental releases ahead of a stable image whose user picked Experimental, and the
+  notice shows `docker pull …:experimental` instead of `:latest`. In a mixed install the Agent's update recovery
+  buttons stay usable while the WebUI notice is shown. Thanks @pxxD1998. (#8040 by @pxxD1998)
+
 - **Gateway chats no longer replay reasoning-only replies or stale recovered prompts as history.** Following #8035,
   the Gateway runs-API history now also leaves out an assistant reply that carried only reasoning (it went out as
   empty assistant content) and a prompt WebUI restored after an interrupted turn, unless that prompt is the question
