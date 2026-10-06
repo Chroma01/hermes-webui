@@ -168,10 +168,12 @@ class SessionChannel:
         q: queue.Queue = queue.Queue(maxsize=maxsize)
         with self._lock:
             self._subscribers.append(q)
-            # Seed the writer-liveness mark: a brand-new subscriber has not written
-            # yet, and seeding at subscribe time gives it a full window before the
-            # reaper may judge it.
-            self._last_write_ok_at[q] = time.time()
+            # NO seed here: a brand-new subscriber has not COMPLETED a write yet, and
+            # absence of write evidence is not death evidence. The upstream contract
+            # (tests/test_session_channel_option_x.py::test_session_channel_reaper_keeps_live_subscriber)
+            # asserts an attached subscriber survives a far-future now, and the mark
+            # starts at the first completed write (note_subscriber_write_ok) so that
+            # "no completed write for a whole window" stays POSITIVE evidence of death.
             # Cancel any pending subscribers-empty grace timer.
             self.last_subscriber_drop_at = None
             already_closed = self._closed
@@ -459,7 +461,14 @@ class SessionChannel:
                 and (now - self._stalled_since[q]) >= window
             )
             last_ok = self._last_write_ok_at.get(q)
-            write_stale = last_ok is None or (now - last_ok) >= stale_after
+            # Absent write evidence is NOT death evidence. A subscriber that has not
+            # recorded a successful write is the normal state of a quiet session whose
+            # handler has not flushed yet, and the upstream contract
+            # (tests/test_session_channel_option_x.py::test_session_channel_reaper_keeps_live_subscriber)
+            # requires a channel with an attached subscriber to survive a far-future now.
+            # Death still needs POSITIVE proof: a stalled queue (queue_stalled above) or
+            # a write that succeeded and then aged past the window.
+            write_stale = last_ok is not None and (now - last_ok) >= stale_after
             if queue_stalled or write_stale:
                 dead += 1
         if sub_count == 0 or dead != sub_count:
