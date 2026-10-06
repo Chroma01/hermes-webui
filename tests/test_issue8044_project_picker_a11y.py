@@ -478,3 +478,12 @@ def test_touch_batch_picker_is_capped_so_selected_rows_stay_visible():
     conversations off screen; on coarse pointers it scrolls inside a ~5.5-row cap."""
     css = (Path(__file__).resolve().parent.parent / "static" / "style.css").read_text(encoding="utf-8")
     assert "@media (pointer:coarse){.batch-action-bar .batch-project-picker{max-height:250px;}}" in css
+
+
+def test_single_picker_height_is_clamped_to_the_viewport_room():
+    """Gate 2026-10-06: on a phone with many projects the 44px rows pushed the single picker
+    past the bottom of the screen ("+ New project" unreachable); it now scrolls inside the room
+    left on its side of the anchor."""
+    js = (Path(__file__).resolve().parent.parent / "static" / "sessions.js").read_text(encoding="utf-8")
+    assert "const _pickerRoom=picker.style.top==='auto'?(rect.top-4-8):(window.innerHeight-(rect.bottom+4)-8);" in js
+    assert "picker.style.maxHeight=Math.max(132,_pickerRoom)+'px';" in js

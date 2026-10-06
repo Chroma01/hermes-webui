@@ -10092,6 +10092,10 @@ function _showProjectPicker(session, anchorEl){
     picker.style.top=(rect.bottom+4)+'px';
     picker.style.bottom='auto';
   }
+  // Never run past the viewport edge: with 44px touch rows and many projects the picker
+  // used to extend below the screen, leaving "+ New project" unreachable. Scroll inside it.
+  const _pickerRoom=picker.style.top==='auto'?(rect.top-4-8):(window.innerHeight-(rect.bottom+4)-8);
+  picker.style.maxHeight=Math.max(132,_pickerRoom)+'px';
   // Align right edge of picker with right edge of button; keep within viewport
   const pickerW=Math.min(220,Math.max(160,picker.scrollWidth||160));
   let left=rect.right-pickerW;
