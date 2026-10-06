@@ -10176,6 +10176,9 @@ function _focusProjectPickerRow(picker, row){
   const rect=row.getBoundingClientRect();
   if(rect.top<top) picker.scrollTop-=top-rect.top;
   else if(rect.bottom>bottom) picker.scrollTop+=rect.bottom-bottom;
+  // With a mouse the batch picker is no scroll box: it grows inside the
+  // conversation list, and the list is what brings its row onto the screen.
+  row.scrollIntoView({block:'nearest'});
   return true;
 }
 

@@ -59,6 +59,7 @@ class El {
   addEventListener(type, fn){ (this.listeners[type] = this.listeners[type] || []).push(fn); }
   dispatch(type, event){ (this.listeners[type] || []).forEach(fn => fn(event)); }
   focus(){ if (this.isConnected && !this.unfocusable) active = this; }
+  scrollIntoView(options){ this.revealed = options; }
   hasClass(name){ return this.className.split(/\s+/).includes(name); }
   querySelectorAll(selector){
     if (selector === '.project-picker-item:not([disabled])')
@@ -327,6 +328,18 @@ console.log(JSON.stringify({seen, refused, after: picker.scrollTop}));
         ["Client work", 50],     # flush with the inner bottom edge: untouched
     ]
     assert out["refused"] is False and out["after"] == 50
+
+
+def test_a_focused_row_is_brought_onto_the_screen_by_whatever_scrolls_it():
+    """The batch picker does not scroll with a mouse; the conversation list around
+    it does. The nearest edge, so a row already in view does not move."""
+    out = _run(PICKER_WITH_ROWS + r"""
+const refused = _focusProjectPickerRow(picker, {isConnected: false});
+_focusProjectPickerRow(picker, rows[2]);
+console.log(JSON.stringify({refused, revealed: rows.map(row => row.revealed || null)}));
+""")
+    assert out["refused"] is False
+    assert out["revealed"] == [None, None, {"block": "nearest"}, None]
 
 
 def test_the_reveal_stops_inside_the_pickers_border():

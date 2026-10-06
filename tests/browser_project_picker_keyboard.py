@@ -34,7 +34,9 @@ WHAT IT CHECKS
     focus to the parent's own trigger, also after a sidebar repaint.
   a long list (twelve more projects, a 420px-tall window)
   - the picker scrolls inside itself, and the row that End, Home or opening
-    puts focus on is inside the picker's visible box.
+    puts focus on is inside the picker's visible box;
+  - the batch picker, which with a mouse grows inside the conversation list
+    instead: the row End, Home or ArrowUp puts focus on is on screen.
   rows under a coarse pointer (a touch context, 390x844, the sidebar drawer open)
   - every row of both pickers is at least 44px tall; with a mouse they keep
     their compact height.
@@ -673,6 +675,48 @@ def _check_long_list(page, seed):
     return failures
 
 
+FOCUSED_ROW_ON_SCREEN_JS = """() => {
+  const row = document.activeElement;
+  const picker = document.querySelector('.batch-project-picker');
+  if (!picker || !row || !picker.contains(row)) return {problem: 'focus is not on a batch picker row'};
+  const rect = row.getBoundingClientRect();
+  const hit = document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
+  return {
+    text: row.textContent.trim(),
+    onScreen: !!hit && (hit === row || row.contains(hit)),
+    y: Math.round(rect.top) + '..' + Math.round(rect.bottom) + ' of ' + innerHeight,
+    taller: picker.getBoundingClientRect().height > innerHeight - picker.getBoundingClientRect().top,
+  };
+}"""
+
+
+def _check_batch_long_list(page, seed):
+    """The batch picker sits in the conversation list and, with a mouse, grows
+    with its rows. The row the keyboard puts focus on is scrolled onto the screen."""
+    problem = _open_batch_picker(page, seed)
+    if problem:
+        return [f"  [batch long list] {problem}"]
+    failures = []
+    first = page.evaluate(FOCUSED_ROW_ON_SCREEN_JS)
+    if first.get("problem"):
+        return [f"  [batch long list] {first['problem']}"]
+    if not first["taller"]:
+        failures.append("  [batch long list] the batch picker fits the window: the long list was not seeded")
+    for key, want in (("End", LONG_PROJECTS[-1]), ("Home", "No project"), ("ArrowUp", LONG_PROJECTS[-1])):
+        page.keyboard.press(key)
+        page.wait_for_timeout(150)
+        state = page.evaluate(FOCUSED_ROW_ON_SCREEN_JS)
+        if state.get("problem") or state["text"] != want:
+            failures.append(f"  [batch long list] {key} put focus on {state.get('text')!r}, expected {want!r}")
+        elif not state["onScreen"]:
+            failures.append(
+                f"  [batch long list] after {key} the focused row {want!r} is off screen (y={state['y']})"
+            )
+    page.keyboard.press("Escape")
+    page.evaluate("exitSessionSelectMode()")
+    return failures
+
+
 MANY_CONVERSATIONS = 40
 # A phone upright, a small phone, and a phone on its side.
 PHONE_VIEWPORTS = ((390, 844), (375, 667), (844, 390))
@@ -1011,6 +1055,10 @@ def main():
                 failures.extend(found)
                 if not found:
                     print("OK  long list — the focused row is inside the picker's box")
+                found = _check_batch_long_list(page, seed)
+                failures.extend(found)
+                if not found:
+                    print("OK  batch long list — the focused row is scrolled onto the screen")
                 failures.extend(f"  [long list] pageerror: {err}" for err in errors)
                 ctx.close()
 
