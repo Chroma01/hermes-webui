@@ -772,9 +772,25 @@ def test_quota_card_failure_message_is_coloured_by_state_and_takes_its_own_row()
     css = (ROOT / "static" / "style.css").read_text(encoding="utf-8")
     # Scoped to the card body: the cost chart's empty state reuses the class and is not a failure.
     assert ".provider-quota-card-invalid_key .provider-quota-body>.provider-quota-message{color:var(--error);}" in css
-    assert ".provider-quota-card-unavailable .provider-quota-body>.provider-quota-message{color:var(--warning);}" in css
+    assert (
+        ".provider-quota-card-unavailable .provider-quota-body>.provider-quota-message"
+        "{color:color-mix(in srgb,var(--warning) 55%,var(--text));}"
+    ) in css
     assert not re.search(r"provider-quota-card-\w+ \.provider-quota-message\{", css)
     assert ".provider-quota-body>.provider-quota-message{width:100%;}" in css
+
+
+def test_quota_card_unavailable_badge_matches_its_warning_message():
+    """Fable UX gate r2 (2026-10-06): the unavailable card coloured its message but its badge
+    fell back to the accent gold; it now shares the warning badge rule with no_key/unsupported."""
+    css = (ROOT / "static" / "style.css").read_text(encoding="utf-8")
+    rules = re.findall(r"([^{}]*)\{background:rgba\(234,179,8,\.12\);color:var\(--warning\);\}", css)
+    badge_rules = [{s.strip() for s in group.split(",")} for group in rules
+                   if ".provider-quota-card-no_key .provider-quota-badge" in group]
+    assert len(badge_rules) == 1, "warning badge rule missing or duplicated"
+    selectors = badge_rules[0]
+    assert ".provider-quota-card-unavailable .provider-quota-badge" in selectors
+    assert ".provider-quota-card-unsupported .provider-quota-badge" in selectors
 
 
 def test_quota_card_shows_the_failure_message_above_a_pool_breakdown():
