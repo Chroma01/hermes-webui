@@ -18,6 +18,8 @@ WHAT IT CHECKS
   - Escape closes it and focus returns to the conversation's ⋮ trigger, also
     when the sidebar was repainted while the picker was open (the original
     trigger is gone by then);
+  - opened by a right click on the row instead (the anchor is then the row,
+    which cannot take focus), Escape still returns focus to its ⋮ trigger;
   - Enter on a project and Space on "No project" send the move, as a mouse
     click on a row does;
   - "No project" and "+ New project" follow the interface language.
@@ -25,6 +27,9 @@ WHAT IT CHECKS
   - rows are buttons, focus lands on the first, "No project" is translated;
   - Escape closes it and focus returns to the bar's "Move to project" button;
   - it still sits inside the selection bar.
+  a long list (twelve more projects, a 420px-tall window)
+  - the picker scrolls inside itself, and the row that End, Home or opening
+    puts focus on is inside the picker's visible box.
   rows under a coarse pointer (a touch context, 390x844)
   - every row of both pickers is at least 44px tall; with a mouse they keep
     their compact height.
@@ -297,6 +302,29 @@ def _check_single(page, seed):
         if not page.evaluate(FOCUSED_TRIGGER_JS, alpha):
             fail("after a sidebar repaint, Escape did not return focus to the conversation's new ⋮ trigger")
 
+    # Opened by a right click on the row: the menu's anchor is the row (or its
+    # actions box), not the trigger. Escape still lands on the trigger.
+    page.wait_for_timeout(SETTLE_MS)
+    page.click(f'.session-item[data-sid="{alpha}"]', button="right")
+    if not _wait_until(page, "!!document.querySelector('.session-action-menu')", 1500):
+        fail("a right click on the row did not open the ⋮ menu")
+    else:
+        page.evaluate(
+            """() => {
+              const label = t('session_move_project');
+              Array.from(document.querySelectorAll('.session-action-menu .session-action-opt'))
+                .find(opt => opt.textContent.trim() === label).focus();
+            }"""
+        )
+        page.keyboard.press("Enter")
+        if not _wait_until(page, f"!!document.querySelector('{SINGLE}')", 1500):
+            fail("the picker did not open from the right-click menu")
+        else:
+            page.keyboard.press("Escape")
+            page.wait_for_timeout(100)
+            if not page.evaluate(FOCUSED_TRIGGER_JS, alpha):
+                fail("opened by right click, Escape did not return focus to the conversation's ⋮ trigger")
+
     # Enter on a project moves the conversation.
     moves = []
     page.on(
@@ -419,14 +447,14 @@ def _check_batch(page, seed):
     page.keyboard.press("End")
     if _focused_text(page) != PROJECTS[-1]:
         fail(f"End moved focus to {_focused_text(page)!r}")
+    on_move_button = (
+        "(() => { const a = document.activeElement; return !!a && a.isConnected"
+        " && a.classList.contains('batch-action-btn') && a.textContent.trim() === t('session_batch_move'); })()"
+    )
     page.keyboard.press("Escape")
     if not _wait_until(page, f"!document.querySelector('{BATCH}')"):
         fail("Escape did not close the batch picker")
-    on_move_button = page.evaluate(
-        "() => { const a = document.activeElement; return !!a && a.classList.contains('batch-action-btn')"
-        " && a.textContent.trim() === t('session_batch_move'); }"
-    )
-    if not on_move_button:
+    if not page.evaluate(on_move_button):
         fail("after Escape focus is not on the bar's 'Move to project' button")
     page.evaluate("() => { exitSessionSelectMode(); setLocale('en'); }")
     return failures
@@ -484,6 +512,46 @@ def _check_heights(page, seed, *, coarse):
             failures.append(f"  [touch] {name} picker rows are {heights}px tall, under {MIN_TOUCH_ROW_PX}px")
         if not coarse and max(heights) >= MIN_TOUCH_ROW_PX:
             failures.append(f"  [mouse] {name} picker rows grew to {heights}px with a fine pointer")
+    return failures
+
+
+ROW_IN_BOX_JS = """() => {
+  const picker = document.querySelector('.project-picker:not(.batch-project-picker)');
+  const row = document.activeElement;
+  if (!picker || !row || !picker.contains(row)) return {problem: 'focus is not on a picker row'};
+  const box = picker.getBoundingClientRect();
+  const rect = row.getBoundingClientRect();
+  return {
+    text: row.textContent.trim(),
+    inside: rect.top >= box.top - 1 && rect.bottom <= box.bottom + 1,
+    scrolls: picker.scrollHeight > picker.clientHeight + 1,
+  };
+}"""
+
+
+def _check_long_list(page, seed):
+    """With more rows than fit, the row focus lands on is inside the picker's box."""
+    failures = []
+    problem = _open_single_picker(page, seed["alpha"])
+    if problem:
+        return [f"  [long list] {problem}"]
+    opened = page.evaluate(ROW_IN_BOX_JS)
+    if opened.get("problem"):
+        return [f"  [long list] {opened['problem']}"]
+    if not opened["scrolls"]:
+        failures.append("  [long list] the picker does not scroll inside itself")
+    if opened["text"] != LONG_PROJECTS[-1]:
+        failures.append(f"  [long list] focus opened on {opened['text']!r}, expected the current project")
+    if not opened["inside"]:
+        failures.append(f"  [long list] on open the focused row {opened['text']!r} is outside the picker's box")
+    for key, want in (("End", "+ New project"), ("Home", "No project"), ("ArrowUp", "+ New project")):
+        page.keyboard.press(key)
+        state = page.evaluate(ROW_IN_BOX_JS)
+        if state.get("problem") or state["text"] != want:
+            failures.append(f"  [long list] {key} put focus on {state.get('text')!r}, expected {want!r}")
+        elif not state["inside"]:
+            failures.append(f"  [long list] after {key} the focused row {want!r} is outside the picker's box")
+    page.keyboard.press("Escape")
     return failures
 
 
@@ -609,21 +677,34 @@ def main():
                 failures.extend(f"  [touch] pageerror: {err}" for err in errors)
                 ctx.close()
 
+            ctx, page, errors = _new_page(browser, viewport={"width": 1440, "height": 420})
+            if page is None:
+                failures.append(f"  [long list] {errors}")
+            else:
+                # The conversation goes into the last of them, so its current
+                # project starts below the picker's fold.
+                page.evaluate(
+                    """async ({names, sid}) => {
+                      const post = (path, body) => fetch(path, {
+                        method: 'POST', headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify(body),
+                      }).then(response => response.json());
+                      let last = null;
+                      for (const name of names)
+                        last = (await post('/api/projects/create', {name, color: '#f5c542'})).project.project_id;
+                      await post('/api/session/move', {session_id: sid, project_id: last});
+                      await renderSessionList();
+                    }""",
+                    {"names": LONG_PROJECTS, "sid": seed["alpha"]},
+                )
+                found = _check_long_list(page, seed)
+                failures.extend(found)
+                if not found:
+                    print("OK  long list — the focused row is inside the picker's box")
+                failures.extend(f"  [long list] pageerror: {err}" for err in errors)
+                ctx.close()
+
             if shots:
-                ctx, page, errors = _new_page(browser, viewport={"width": 1440, "height": 900})
-                if page is not None:
-                    page.evaluate(
-                        """async (names) => {
-                          for (const name of names) {
-                            await fetch('/api/projects/create', {
-                              method: 'POST', headers: {'Content-Type': 'application/json'},
-                              body: JSON.stringify({name, color: '#f5c542'}),
-                            });
-                          }
-                        }""",
-                        LONG_PROJECTS,
-                    )
-                    ctx.close()
                 _screenshots(browser, shots, seed)
             browser.close()
 

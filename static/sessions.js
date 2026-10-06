@@ -10150,23 +10150,41 @@ function _wireProjectPickerKeys(picker, onEscape){
     else if(e.key==='End') nextIndex=items.length-1;
     if(nextIndex===null) return;
     e.preventDefault();
-    _focusSessionActionMenuRestoreTarget(items[nextIndex]);
+    _focusProjectPickerRow(picker,items[nextIndex]);
   });
+}
+
+// Focus a row and bring it into the picker's own scroll box. The focus itself
+// must not scroll (that would move the sidebar or the page), so a row past the
+// edge of a long, scrolling picker is revealed here instead.
+function _focusProjectPickerRow(picker, row){
+  if(!_focusSessionActionMenuRestoreTarget(row)) return false;
+  const box=picker.getBoundingClientRect();
+  const rect=row.getBoundingClientRect();
+  if(rect.top<box.top) picker.scrollTop-=box.top-rect.top;
+  else if(rect.bottom>box.bottom) picker.scrollTop+=rect.bottom-box.bottom;
+  return true;
 }
 
 // On open, focus lands on the session's current project, else on the first row.
 function _focusProjectPickerItem(picker){
   const target=picker.querySelector('.project-picker-item.active')||picker.querySelector('.project-picker-item');
-  return _focusSessionActionMenuRestoreTarget(target);
+  return _focusProjectPickerRow(picker,target);
 }
 
-// Where focus returns when a session's picker closes: the ⋮ trigger it was
-// opened from. The sidebar may have been repainted since, which replaces that
-// button, so fall back to the trigger of the row now showing the session.
+// Where focus returns when a session's picker closes: the conversation's ⋮
+// trigger. The picker is anchored on that trigger, or, after a right click or
+// a long press, on the row or its actions box, which hold the trigger but
+// cannot take focus themselves. The sidebar may also have been repainted
+// since, which replaces all of them: then it is the trigger of the row now
+// showing the session.
 function _projectPickerFocusReturnTarget(session, anchorEl){
-  if(anchorEl&&anchorEl.isConnected) return anchorEl;
-  const row=_findSessionRenameRow(session&&session.session_id);
-  return row?row.querySelector('.session-actions-trigger'):null;
+  const triggerOf=el=>{
+    if(!el||!el.isConnected) return null;
+    if(el.classList&&el.classList.contains('session-actions-trigger')) return el;
+    return el.querySelector('.session-actions-trigger');
+  };
+  return triggerOf(anchorEl)||triggerOf(_findSessionRenameRow(session&&session.session_id));
 }
 
 // Resize a .project-create-input to fit its current value (or placeholder).

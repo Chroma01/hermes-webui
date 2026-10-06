@@ -47,7 +47,10 @@ let active = null;
 const body = {tagName: 'BODY'};
 class El {
   constructor(tag){ this.tagName = tag.toUpperCase(); this.attrs = {}; this.children = []; this.className = '';
-    this.isConnected = true; this.listeners = {}; this.disabled = false; }
+    this.isConnected = true; this.listeners = {}; this.disabled = false; this.scrollTop = 0;
+    this.rect = {top: 0, bottom: 0};
+    this.classList = {contains: name => this.hasClass(name)}; }
+  getBoundingClientRect(){ return this.rect; }
   setAttribute(name, value){ this.attrs[name] = String(value); }
   getAttribute(name){ return Object.prototype.hasOwnProperty.call(this.attrs, name) ? this.attrs[name] : null; }
   appendChild(child){ this.children.push(child); child.parent = this; return child; }
@@ -65,7 +68,10 @@ class El {
       return this.children.find(c => c.hasClass('project-picker-item') && c.hasClass('active')) || null;
     if (selector === '.project-picker-item')
       return this.children.find(c => c.hasClass('project-picker-item')) || null;
-    if (selector === '.session-actions-trigger') return this.trigger || null;
+    if (selector === '.session-actions-trigger') {
+      const find = el => el.hasClass('session-actions-trigger') ? el : el.children.map(find).find(Boolean) || null;
+      return this.children.map(find).find(Boolean) || null;
+    }
     throw new Error('unexpected selector ' + selector);
   }
 }
@@ -186,26 +192,103 @@ console.log(JSON.stringify({escaped, prevented: event.prevented, stopped: event.
     assert out == {"escaped": 1, "prevented": True, "stopped": True}
 
 
+SIDEBAR_ROW = r"""
+function sidebarRow(label){
+  const row = new El('div'); row.className = 'session-item';
+  const actions = row.appendChild(new El('div')); actions.className = 'session-actions';
+  const trigger = actions.appendChild(new El('button')); trigger.className = 'session-actions-trigger';
+  trigger.label = label;
+  return {row, actions, trigger};
+}
+const label = el => el && el.label || null;
+"""
+
+
 def test_focus_returns_to_the_trigger_the_picker_opened_from():
-    out = _run(r"""
-const trigger = new El('button'); trigger.label = 'original';
-console.log(JSON.stringify(_projectPickerFocusReturnTarget({session_id: 'sa'}, trigger).label));
+    out = _run(SIDEBAR_ROW + r"""
+const {trigger} = sidebarRow('original');
+console.log(JSON.stringify(label(_projectPickerFocusReturnTarget({session_id: 'sa'}, trigger))));
 """)
     assert out == "original"
+
+
+def test_a_row_or_its_actions_box_as_the_anchor_resolves_to_the_trigger():
+    """A right click or a long press opens the ⋮ menu on the row or its actions
+    box. Neither can take focus; the trigger inside the row can."""
+    out = _run(SIDEBAR_ROW + r"""
+const {row, actions} = sidebarRow('of this row');
+console.log(JSON.stringify({
+  fromRow: label(_projectPickerFocusReturnTarget({session_id: 'sa'}, row)),
+  fromActions: label(_projectPickerFocusReturnTarget({session_id: 'sa'}, actions)),
+}));
+""")
+    assert out == {"fromRow": "of this row", "fromActions": "of this row"}
 
 
 def test_after_a_repaint_focus_returns_to_the_rows_new_trigger():
     """The sidebar is rebuilt on every refresh, which detaches the trigger the
     picker opened from. The conversation's row is looked up again by its id."""
-    out = _run(r"""
-const original = new El('button'); original.isConnected = false;
-const row = new El('div'); row.trigger = new El('button'); row.trigger.label = 'repainted';
-rowsBySid['sa'] = row;
-const found = _projectPickerFocusReturnTarget({session_id: 'sa'}, original);
-const gone = _projectPickerFocusReturnTarget({session_id: 'filtered-away'}, original);
-console.log(JSON.stringify({found: found && found.label, gone}));
+    out = _run(SIDEBAR_ROW + r"""
+const original = sidebarRow('original');
+original.trigger.isConnected = false; original.row.isConnected = false; original.actions.isConnected = false;
+rowsBySid['sa'] = sidebarRow('repainted').row;
+console.log(JSON.stringify({
+  fromTrigger: label(_projectPickerFocusReturnTarget({session_id: 'sa'}, original.trigger)),
+  fromRow: label(_projectPickerFocusReturnTarget({session_id: 'sa'}, original.row)),
+  gone: _projectPickerFocusReturnTarget({session_id: 'filtered-away'}, original.trigger),
+}));
 """)
-    assert out == {"found": "repainted", "gone": None}
+    assert out == {"fromTrigger": "repainted", "fromRow": "repainted", "gone": None}
+
+
+def test_a_focused_row_is_scrolled_into_the_pickers_box():
+    """The focus call itself must not scroll, so a row beyond the edge of a
+    long picker is brought in by moving the picker's own scroll position."""
+    out = _run(PICKER_WITH_ROWS + r"""
+picker.rect = {top: 100, bottom: 300};
+picker.scrollTop = 50;
+const seen = [];
+for (const [index, top, bottom] of [[3, 320, 364], [0, 60, 104], [1, 120, 164], [2, 256, 300]]) {
+  rows[index].rect = {top, bottom};
+  _focusProjectPickerRow(picker, rows[index]);
+  seen.push([focused(), picker.scrollTop]);
+  picker.scrollTop = 50;
+}
+rows[1].unfocusable = true; active = null;
+const refused = _focusProjectPickerRow(picker, rows[1]);
+console.log(JSON.stringify({seen, refused, after: picker.scrollTop}));
+""")
+    assert out["seen"] == [
+        ["+ New project", 114],  # 64px below the box
+        ["No project", 10],      # 40px above it
+        ["Research", 50],        # inside: untouched
+        ["Client work", 50],     # flush with the bottom edge: untouched
+    ]
+    assert out["refused"] is False and out["after"] == 50
+
+
+def test_opening_reveals_the_current_project_too():
+    """With enough projects the conversation's own one starts below the fold."""
+    out = _run(PICKER_WITH_ROWS + r"""
+picker.rect = {top: 0, bottom: 100};
+rows.forEach((row, index) => { row.rect = {top: index * 60, bottom: index * 60 + 44}; });
+rows[1].className = 'project-picker-item';
+rows[2].className = 'project-picker-item active';
+_focusProjectPickerItem(picker);
+console.log(JSON.stringify({focused: focused(), scrollTop: picker.scrollTop}));
+""")
+    assert out == {"focused": "Client work", "scrollTop": 64}
+
+
+def test_arrow_keys_reveal_the_row_they_move_to():
+    out = _run(PICKER_WITH_ROWS + r"""
+picker.rect = {top: 0, bottom: 100};
+rows.forEach((row, index) => { row.rect = {top: index * 44, bottom: index * 44 + 44}; });
+rows[0].focus();
+press('End');
+console.log(JSON.stringify({focused: focused(), scrollTop: picker.scrollTop}));
+""")
+    assert out == {"focused": "+ New project", "scrollTop": 76}
 
 
 def test_both_pickers_build_every_row_with_the_helper():
