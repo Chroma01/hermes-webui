@@ -529,7 +529,7 @@ def test_usage_api_quota_definitive_failure_is_reported_next_to_the_pool(monkeyp
 @pytest.mark.parametrize(
     "urlopen, expected",
     [
-        (lambda: _raiser(_http_error(401)), "rejected the configured API key. Update it in Settings"),
+        (lambda: _raiser(_http_error(401)), "rejected the configured API key. Update the key in the provider card below."),
         (lambda: _respond(b'{"usage": {"weekly": {"percent": "NaN"}}, "windowLimits": {"weekly": {"used": -1, "cap": 30}}}'), "returned no usable quota windows."),
     ],
     ids=["401", "all-windows-invalid"],

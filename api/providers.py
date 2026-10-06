@@ -2447,8 +2447,10 @@ def get_provider_quota(provider_id: str | None = None, *, refresh: bool = False)
         if definitive or local_snapshot is None:
             if status == "invalid_key":
                 # The key can come from .env, an alias variable or config.yaml, so point
-                # at the one place that edits it rather than name a variable.
-                message = f"{display_name} rejected the configured API key. Update it in Settings → Providers."
+                # at the one place that edits it rather than name a variable. The message
+                # renders only on the quota card at the top of Settings → Providers, so
+                # point down to the provider's own card instead of naming the page it is on.
+                message = f"{display_name} rejected the configured API key. Update the key in the provider card below."
             elif definitive:
                 message = f"{display_name} returned no usable quota windows."
             else:
