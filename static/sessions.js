@@ -10083,27 +10083,26 @@ function _showProjectPicker(session, anchorEl){
   const rect=anchorEl.getBoundingClientRect();
   picker.style.position='fixed';
   picker.style.zIndex='999';
-  // Prefer opening below; flip above if too close to bottom of viewport
-  const spaceBelow=window.innerHeight-rect.bottom;
-  if(spaceBelow<160&&rect.top>160){
-    picker.style.bottom=(window.innerHeight-rect.top+4)+'px';
-    picker.style.top='auto';
-  }else{
-    picker.style.top=(rect.bottom+4)+'px';
-    picker.style.bottom='auto';
+  // Placed as _positionSessionActionMenu places the ⋮ menu: below the anchor,
+  // above it when that fits whole, else slid up over the anchor until it fits.
+  // Natural height first (the CSS already caps it at 100dvh - 16px).
+  picker.style.maxHeight='';
+  const pickerH=picker.offsetHeight||0;
+  const margin=8;
+  const maxAvail=window.innerHeight-margin*2;
+  let top=rect.bottom+4;
+  if(top+pickerH>window.innerHeight-margin && rect.top>pickerH+12){
+    top=rect.top-pickerH-4;            // flip above when there is room
   }
-  // Never run past the viewport edge: with 44px touch rows and many projects the picker
-  // used to extend below the screen, leaving "+ New project" unreachable. Scroll inside it.
-  const _pickerRoom=picker.style.top==='auto'?(rect.top-4-8):(window.innerHeight-(rect.bottom+4)-8);
-  if(_pickerRoom<132){
-    // A tall anchor on a short screen (a parent row with its forks open, on a phone
-    // on its side) leaves under three rows on either side: take the screen instead.
-    picker.style.top='8px';
-    picker.style.bottom='auto';
-    picker.style.maxHeight=(window.innerHeight-16)+'px';
+  if(pickerH>maxAvail){
+    picker.style.maxHeight=maxAvail+'px'; // taller than the screen: pin and scroll
+    top=margin;
   }else{
-    picker.style.maxHeight=_pickerRoom+'px';
+    if(top+pickerH>window.innerHeight-margin) top=window.innerHeight-margin-pickerH;
+    if(top<margin) top=margin;         // slide to fit, overlapping the anchor
   }
+  picker.style.top=top+'px';
+  picker.style.bottom='auto';
   // Align right edge of picker with right edge of button; keep within viewport
   const pickerW=Math.min(220,Math.max(160,picker.scrollWidth||160));
   let left=rect.right-pickerW;

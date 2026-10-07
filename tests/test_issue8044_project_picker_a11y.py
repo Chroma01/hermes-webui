@@ -508,21 +508,24 @@ def test_touch_batch_picker_is_capped_so_selected_rows_stay_visible():
     assert "@media (pointer:coarse){.batch-action-bar .batch-project-picker{max-height:250px;overflow-y:auto;}}" in css
 
 
-def test_single_picker_height_is_clamped_to_the_viewport_room():
-    """Gate 2026-10-06: on a phone with many projects the 44px rows pushed the single picker
-    past the bottom of the screen ("+ New project" unreachable); it now scrolls inside the room
-    left on its side of the anchor."""
+def test_single_picker_is_placed_as_the_session_action_menu_is():
+    """Gate 2026-10-07: the picker had a room rule of its own, which left a short list
+    scrolling in a strip beside a tall anchor while the ⋮ menu beside it slid into view.
+    It now measures its natural height, flips above when that fits whole, slides over the
+    anchor otherwise, and pins to the top and scrolls only when taller than the screen."""
     js = (Path(__file__).resolve().parent.parent / "static" / "sessions.js").read_text(encoding="utf-8")
-    assert "const _pickerRoom=picker.style.top==='auto'?(rect.top-4-8):(window.innerHeight-(rect.bottom+4)-8);" in js
-    assert "picker.style.maxHeight=_pickerRoom+'px';" in js
-
-
-def test_single_picker_takes_the_screen_when_neither_side_of_its_anchor_has_room():
-    """Gate 2026-10-06, second pass: a 132px floor beside a tall anchor (a parent row with
-    its forks open, on a phone on its side) pushed "+ New project" below the screen."""
-    js = (Path(__file__).resolve().parent.parent / "static" / "sessions.js").read_text(encoding="utf-8")
-    assert "Math.max(132,_pickerRoom)" not in js
-    fallback = _between(js, "if(_pickerRoom<132){", "}else{")
-    assert "picker.style.top='8px';" in fallback
-    assert "picker.style.bottom='auto';" in fallback
-    assert "picker.style.maxHeight=(window.innerHeight-16)+'px';" in fallback
+    block = _between(js, "picker.style.maxHeight='';", "picker.style.bottom='auto';")
+    for line in (
+        "const pickerH=picker.offsetHeight||0;",
+        "const maxAvail=window.innerHeight-margin*2;",
+        "let top=rect.bottom+4;",
+        "if(top+pickerH>window.innerHeight-margin && rect.top>pickerH+12){",
+        "top=rect.top-pickerH-4;",
+        "if(pickerH>maxAvail){",
+        "picker.style.maxHeight=maxAvail+'px';",
+        "if(top+pickerH>window.innerHeight-margin) top=window.innerHeight-margin-pickerH;",
+        "if(top<margin) top=margin;",
+        "picker.style.top=top+'px';",
+    ):
+        assert line in block, line
+    assert "_pickerRoom" not in js and "spaceBelow<160" not in js

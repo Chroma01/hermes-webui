@@ -40,7 +40,15 @@ WHAT IT CHECKS
   rows under a coarse pointer (a touch context, 390x844, the sidebar drawer open)
   - every row of both pickers is at least 44px tall; with a mouse they keep
     their compact height.
-  a long list of conversations (forty more) and the fifteen projects
+  a long list of conversations (forty more), still three projects
+  - on a phone upright (390x844, 375x667, touch) the five rows show whole, below
+    their anchor, and above it from the last conversation on screen;
+  - on a phone on its side (844x390, 667x375), opened from a parent
+    conversation whose four open forks make its row taller than the room
+    above or below it, at every 20px list position that shows the row: the
+    five rows show whole and do not scroll, slid up over the anchor from the
+    bottom of the screen only as far as they must.
+  the same list of conversations and fifteen projects
   - with a mouse, a wheel over the open batch picker scrolls the conversation
     list: the picker sits in that list and must not take the scroll;
   - on a phone upright, a small phone and a phone on its side (390x844,
@@ -48,16 +56,15 @@ WHAT IT CHECKS
     and last conversation on screen lets every row be tapped, scrolling inside
     itself where they do not fit; the batch picker stays within its cap,
     scrolls inside it, and every row can be tapped;
-  - on a phone on its side (844x390, 667x375), the same from a parent
-    conversation whose four open forks make its row taller than the room
-    above or below it, with the list scrolled to every 20px position that
-    shows the row.
+  - on a phone on its side, the same from the parent conversation with its
+    forks open, at every list position: the list is now taller than the
+    screen, so the picker is pinned to it and scrolls inside.
 
 SCOPE
   Agent-free, like tests/browser_smoke.py: the real server.py on an ephemeral
   port with isolated temp state. Conversations are imported and projects created
-  through the public API. Which side of its anchor the picker opens on is not
-  checked here, only that its rows can be reached.
+  through the public API. Placement is checked on touch screens only; with a
+  mouse the gate checks the keyboard, not where the picker sits.
 
 USAGE
   python tests/browser_project_picker_keyboard.py
@@ -725,6 +732,7 @@ def _check_batch_long_list(page, seed):
 MANY_CONVERSATIONS = 40
 # A phone upright, a small phone, and each of them on its side.
 PHONE_VIEWPORTS = ((390, 844), (375, 667), (844, 390), (667, 375))
+LANDSCAPE_VIEWPORTS = tuple(size for size in PHONE_VIEWPORTS if size[0] > size[1])
 
 SEED_MANY_JS = """async (count) => {
   const messages = [
@@ -762,6 +770,7 @@ REACHABLE_JS = """(sid) => {
   const session = _allSessions.find(s => s && s.session_id === sid);
   if (!row || !session) return {problem: 'the conversation has no sidebar row'};
   const anchorTop = Math.round(row.getBoundingClientRect().top);
+  const anchorBottom = Math.round(row.getBoundingClientRect().bottom);
   _showProjectPicker(session, row);
   const picker = document.querySelector('.project-picker:not(.batch-project-picker)');
   if (!picker) return {problem: 'the picker did not open'};
@@ -776,13 +785,46 @@ REACHABLE_JS = """(sid) => {
   }
   const box = picker.getBoundingClientRect();
   return {
-    anchorTop, rows: items.length, unreachable,
+    anchorTop, anchorBottom, rows: items.length, unreachable,
     top: Math.round(box.top), bottom: Math.round(box.bottom), viewport: innerHeight,
     content: picker.scrollHeight,
+    scrolls: picker.scrollHeight > picker.clientHeight + 1,
   };
 }"""
 # Three touch rows: a picker squeezed under this shows too little to choose from.
 MIN_PICKER_PX = 3 * MIN_TOUCH_ROW_PX
+
+
+def _misplaced(state):
+    """A failure fragment when the picker leaves the screen, or scrolls a list
+    the screen has room for: it should slide over its anchor instead."""
+    if state["top"] < 0 or state["bottom"] > state["viewport"]:
+        return f"the picker spans y={state['top']}..{state['bottom']} of {state['viewport']}"
+    if state["scrolls"] and state["content"] <= state["viewport"] - 16:
+        return (
+            f"the picker scrolls its {state['rows']} rows inside y={state['top']}..{state['bottom']}"
+            f" although their {state['content']}px fit the screen"
+        )
+    return None
+
+
+def _wrong_side(state):
+    """A failure fragment when a picker the screen has room for is not where the
+    ⋮ menu would be: below its anchor, else above it, else slid up from below
+    only as far as it must, which leaves the top of the sidebar uncovered."""
+    if state["content"] > state["viewport"] - 16:
+        return None
+    height = state["bottom"] - state["top"]
+    span = f"y={state['top']}..{state['bottom']}, anchor y={state['anchorTop']}..{state['anchorBottom']}"
+    fits_below = state["anchorBottom"] + 4 + height <= state["viewport"] - 8
+    fits_above = state["anchorTop"] > height + 12
+    if fits_below and state["top"] < state["anchorBottom"]:
+        return f"the picker has room below its anchor but is not there ({span})"
+    if not fits_below and fits_above and state["bottom"] > state["anchorTop"]:
+        return f"the picker has room above its anchor but is not there ({span})"
+    if not fits_below and not fits_above and state["bottom"] < state["viewport"] - 9:
+        return f"the picker fits neither side of its anchor and was not slid up from the bottom ({span})"
+    return None
 
 
 def _too_short(state):
@@ -793,7 +835,7 @@ def _too_short(state):
     return None
 
 
-def _check_phone_geometry(page, size):
+def _check_phone_geometry(page, size, rows=10):
     """On a phone, with a screenful of conversations and 15 projects, every row of
     the picker can be tapped wherever in the list it was opened."""
     page.evaluate(FIRST_CONVERSATION_TO_TOP_JS)
@@ -808,10 +850,10 @@ def _check_phone_geometry(page, size):
         if state.get("problem"):
             failures.append(f"  [phone {size}] {where} conversation: {state['problem']}")
             continue
-        if state["rows"] < 10:
-            failures.append(f"  [phone {size}] the picker has only {state['rows']} rows: the long list was not seeded")
-        if _too_short(state):
-            failures.append(f"  [phone {size}] opened from the {where} conversation on screen: {_too_short(state)}")
+        if state["rows"] < rows:
+            failures.append(f"  [phone {size}] the picker has only {state['rows']} rows: the list was not seeded")
+        for problem in filter(None, (_misplaced(state), _wrong_side(state), _too_short(state))):
+            failures.append(f"  [phone {size}] opened from the {where} conversation on screen: {problem}")
         if state["unreachable"]:
             failures.append(
                 f"  [phone {size}] opened from the {where} conversation on screen (y={state['anchorTop']}), the picker spans"
@@ -859,29 +901,37 @@ TALL_ANCHOR_AT_JS = """({sid, offset}) => {
 }"""
 
 
-def _check_tall_anchor(page, seed, size):
+def _check_tall_anchor(page, seed, size, *, long_list):
     """A phone on its side, the picker opened from a parent conversation whose
     expanded forks make its row taller than the room left above or below it:
-    every row can still be tapped, wherever the list is scrolled to."""
+    every row can still be tapped, wherever the list is scrolled to. A short
+    list shows whole, over its anchor if need be; a long one scrolls."""
+    label = "tall anchor, long list" if long_list else "tall anchor, short list"
     failures = []
     tried = 0
     for offset in range(-140, 260, 20):
         where = page.evaluate(TALL_ANCHOR_AT_JS, {"sid": seed["beta"], "offset": offset})
         if where.get("problem"):
-            return [f"  [tall anchor {size}] {where['problem']}"]
+            return [f"  [{label} {size}] {where['problem']}"]
         if where["height"] < 132:
-            return [f"  [tall anchor {size}] the expanded parent row is only {where['height']}px tall"]
+            return [f"  [{label} {size}] the expanded parent row is only {where['height']}px tall"]
         if not where["visible"]:
             continue
         tried += 1
         state = page.evaluate(REACHABLE_JS, seed["beta"])
+        if not state.get("problem") and (state["content"] > state["viewport"] - 16) != long_list:
+            failures.append(
+                f"  [{label} {size}] the picker's {state['rows']} rows are {state['content']}px tall"
+                f" on a {state['viewport']}px screen: the wrong list was seeded"
+            )
         if state.get("problem"):
-            failures.append(f"  [tall anchor {size}] row at y={where['top']}: {state['problem']}")
-        elif _too_short(state):
-            failures.append(f"  [tall anchor {size}] parent row at y={where['top']}: {_too_short(state)}")
+            failures.append(f"  [{label} {size}] row at y={where['top']}: {state['problem']}")
+        elif _misplaced(state) or _wrong_side(state) or _too_short(state):
+            problem = _misplaced(state) or _wrong_side(state) or _too_short(state)
+            failures.append(f"  [{label} {size}] parent row at y={where['top']}: {problem}")
         elif state["unreachable"]:
             failures.append(
-                f"  [tall anchor {size}] parent row at y={where['top']} ({where['height']}px tall): the picker spans"
+                f"  [{label} {size}] parent row at y={where['top']} ({where['height']}px tall): the picker spans"
                 f" y={state['top']}..{state['bottom']} of {state['viewport']} and"
                 f" {len(state['unreachable'])} of {state['rows']} rows cannot be tapped"
             )
@@ -889,7 +939,7 @@ def _check_tall_anchor(page, seed, size):
         if not _wait_until(page, f"!document.querySelector('{SINGLE}')", 1500):
             page.evaluate("document.querySelectorAll('.project-picker').forEach(p => p.remove())")
     if tried < 8:
-        failures.append(f"  [tall anchor {size}] only {tried} list positions showed the parent row")
+        failures.append(f"  [{label} {size}] only {tried} list positions showed the parent row")
     return failures
 
 
@@ -1111,6 +1161,12 @@ def main():
             failures.extend(found)
             if not found:
                 print("OK  fork parent — focus returns to the parent's own trigger")
+            # For what follows: a list of conversations longer than any screen,
+            # and a parent row made tall by four forks.
+            page.evaluate(SEED_MANY_JS, MANY_CONVERSATIONS)
+            forks = page.evaluate(MORE_FORKS_JS, seed["beta"])
+            if forks.get("problem"):
+                failures.append(f"  [tall anchor] {forks['problem']}")
             failures.extend(f"  [desktop] pageerror: {err}" for err in errors)
             ctx.close()
 
@@ -1128,6 +1184,33 @@ def main():
                 if not found:
                     print(f"OK  touch — every row is at least {MIN_TOUCH_ROW_PX}px tall")
                 failures.extend(f"  [touch] pageerror: {err}" for err in errors)
+                ctx.close()
+
+            # Still three projects: five rows, which every phone has room for.
+            for width, height in PHONE_VIEWPORTS:
+                size = f"{width}x{height}"
+                ctx, page, errors = _new_page(
+                    browser, viewport={"width": width, "height": height}, has_touch=True, is_mobile=True
+                )
+                if page is None:
+                    failures.append(f"  [short list {size}] {errors}")
+                    continue
+                _open_mobile_drawer(page)
+                page.evaluate("renderSessionList()")
+                page.wait_for_timeout(SETTLE_MS)
+                if width < height:
+                    found = _check_phone_geometry(page, size, rows=5)
+                    failures.extend(found)
+                    if not found:
+                        print(f"OK  short list {size} — below its anchor, and above it at the bottom of the list")
+                    failures.extend(f"  [short list {size}] pageerror: {err}" for err in errors)
+                    ctx.close()
+                    continue
+                found = _check_tall_anchor(page, seed, size, long_list=False)
+                failures.extend(found)
+                if not found:
+                    print(f"OK  tall anchor, short list {size} — all five rows show without scrolling, at every list position")
+                failures.extend(f"  [tall anchor, short list {size}] pageerror: {err}" for err in errors)
                 ctx.close()
 
             ctx, page, errors = _new_page(browser, viewport={"width": 1440, "height": 420})
@@ -1161,16 +1244,11 @@ def main():
                 failures.extend(f"  [long list] pageerror: {err}" for err in errors)
                 ctx.close()
 
-            # From here on the server holds 15 projects; add a list of
-            # conversations longer than any screen.
+            # From here on the server holds 15 projects.
             ctx, page, errors = _new_page(browser, viewport={"width": 1440, "height": 900})
             if page is None:
                 failures.append(f"  [wheel] {errors}")
             else:
-                page.evaluate(SEED_MANY_JS, MANY_CONVERSATIONS)
-                forks = page.evaluate(MORE_FORKS_JS, seed["beta"])
-                if forks.get("problem"):
-                    failures.append(f"  [tall anchor] {forks['problem']}")
                 page.wait_for_timeout(SETTLE_MS)
                 found = _check_batch_wheel(page)
                 failures.extend(found)
@@ -1195,10 +1273,10 @@ def main():
                 found += _check_batch_on_touch(page, size)
                 if width > height:
                     page.wait_for_timeout(SETTLE_MS)
-                    tall = _check_tall_anchor(page, seed, size)
+                    tall = _check_tall_anchor(page, seed, size, long_list=True)
                     found += tall
                     if not tall:
-                        print(f"OK  tall anchor {size} — every row can be tapped from an expanded parent, at every list position")
+                        print(f"OK  tall anchor, long list {size} — every row can be tapped from an expanded parent, at every list position")
                 failures.extend(found)
                 if not found:
                     print(f"OK  phone {size} — every row can be tapped: single picker from the top, middle and bottom, batch picker capped")
