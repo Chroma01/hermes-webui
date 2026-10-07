@@ -53,6 +53,9 @@ WHAT IT CHECKS
     sidebar repaint replaced the row it was opened from), a phone is turned
     on its side and a tablet is turned, every row can still be tapped and the
     picker still lines up with its anchor.
+  the same list of conversations and fifteen projects, with a mouse
+  - a list that fits a 900px-tall window and not a 420px one: after the
+    resize the row the keyboard was on is inside the picker's box.
   the same list of conversations and fifteen projects
   - with a mouse, a wheel over the open batch picker scrolls the conversation
     list: the picker sits in that list and must not take the scroll;
@@ -1116,6 +1119,41 @@ def _check_batch_on_touch(page, size):
     return failures
 
 
+def _check_resize_keeps_focus_in_view(page):
+    """A list that fits a tall window and not a short one: when the window is made
+    shorter, the row the keyboard is on is still inside the picker's box."""
+    visible = page.evaluate(VISIBLE_ROWS_JS)
+    if not visible:
+        return ["  [resize, focused row] no conversation is on screen"]
+    problem = _open_single_picker(page, visible[0])
+    if problem:
+        return [f"  [resize, focused row] {problem}"]
+    failures = []
+    page.keyboard.press("End")
+    before = page.evaluate(ROW_IN_BOX_JS)
+    if before.get("problem") or before["text"] != "+ New project":
+        failures.append(f"  [resize, focused row] End put focus on {before.get('text')!r}")
+    elif before["scrolls"]:
+        failures.append("  [resize, focused row] the picker already scrolls in the tall window: nothing to cap")
+    size = page.viewport_size
+    page.set_viewport_size({"width": size["width"], "height": 420})
+    page.wait_for_timeout(400)
+    after = page.evaluate(ROW_IN_BOX_JS)
+    if after.get("problem"):
+        failures.append(f"  [resize, focused row] after the resize: {after['problem']}")
+    else:
+        if not after["scrolls"]:
+            failures.append("  [resize, focused row] the picker does not scroll in the short window: nothing was capped")
+        if after["text"] != "+ New project" or not after["inside"]:
+            failures.append(
+                f"  [resize, focused row] after the resize the focused row {after['text']!r} is outside the picker's box"
+            )
+    page.keyboard.press("Escape")
+    page.set_viewport_size(size)
+    page.wait_for_timeout(SETTLE_MS)
+    return failures
+
+
 def _check_batch_wheel(page):
     """A mouse wheel over the open batch picker still scrolls the conversation list."""
     visible = page.evaluate(VISIBLE_ROWS_JS)
@@ -1372,6 +1410,10 @@ def main():
                 failures.extend(found)
                 if not found:
                     print("OK  wheel — the list scrolls with the pointer over the batch picker")
+                found = _check_resize_keeps_focus_in_view(page)
+                failures.extend(found)
+                if not found:
+                    print("OK  resize, focused row — the row the keyboard is on stays inside a picker the resize capped")
                 failures.extend(f"  [wheel] pageerror: {err}" for err in errors)
                 ctx.close()
 

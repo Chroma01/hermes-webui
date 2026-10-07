@@ -546,3 +546,5 @@ def test_an_open_single_picker_is_placed_again_on_resize():
     assert "anchor=_findSessionRenameRow(open.sessionId);" in hook
     assert "_projectPickerFocusReturnTarget({session_id:open.sessionId},null)||anchor" in hook
     assert "if(anchor) _positionProjectPicker(open.picker,anchor);" in hook
+    # Greptile 2026-10-07: the cap a shorter window puts on the picker can cover the focused row.
+    assert "if(focused&&open.picker.contains(focused)) _focusProjectPickerRow(open.picker,focused);" in hook

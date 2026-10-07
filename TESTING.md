@@ -156,7 +156,8 @@ sizes the same must hold from a parent conversation whose open forks make its
 row taller than the room beside it. A list the screen has room for must show
 whole without scrolling: below its anchor, else above it, else slid up over it
 from the bottom of the screen; and an open picker must follow a shorter window
-or a turned phone or tablet, also after a sidebar repaint (#8044). Run it
+or a turned phone or tablet, also after a sidebar repaint, and keep the row the
+keyboard is on inside its box when the resize caps its height (#8044). Run it
 locally with
 `python tests/browser_project_picker_keyboard.py`; add `--screenshots DIR` to
 write the open picker at 390x844, 820x1180, 844x390 and 1440x900.

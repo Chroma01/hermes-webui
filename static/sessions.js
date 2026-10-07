@@ -10150,6 +10150,9 @@ window.addEventListener('resize',()=>{
     }
   }
   if(anchor) _positionProjectPicker(open.picker,anchor);
+  // A shorter window can cap the picker's height over the row the keyboard is on.
+  const focused=document.activeElement;
+  if(focused&&open.picker.contains(focused)) _focusProjectPickerRow(open.picker,focused);
 });
 
 // ── Project picker rows and keyboard (#8044) ────────────────────────────
