@@ -27,8 +27,9 @@ def test_render_messages_runs_highlight_and_tree_init_synchronously(ui_js_conten
     """renderMessages must execute highlightCode and initTreeViews synchronously before scroll restoration."""
     render_fn_idx = ui_js_content.find("function renderMessages(options){")
     assert render_fn_idx != -1, "function renderMessages(options) not found in ui.js"
-    # Inspect the main render tail where scroll restoration and post-processing occur
-    render_tail = ui_js_content[render_fn_idx : render_fn_idx + 60000]
+    # Inspect the main render tail: slice to the next top-level function so the slice covers the main render tail (+96k chars)
+    _prox = ui_js_content.find("\nfunction ", render_fn_idx + 1)
+    render_tail = ui_js_content[render_fn_idx : _prox if _prox != -1 else render_fn_idx + 120000]
 
     highlight_call = "if(typeof highlightCode==='function') highlightCode(inner);"
     tree_init_call = "if(typeof initTreeViews==='function') initTreeViews(inner);"
@@ -50,6 +51,32 @@ def test_render_messages_runs_highlight_and_tree_init_synchronously(ui_js_conten
     assert scroll_pos < raf_pos, (
         "_scrollAfterMessageRender must run before deferred _postProcessWithAnchorSuppression"
     )
+
+
+def test_session_html_cache_preserves_pre_highlight_markup(ui_js_content):
+    """Session HTML cache must snapshot inner.innerHTML before highlightCode and addCopyButtons to prevent dead handlers on cache restore."""
+    render_fn_idx = ui_js_content.find("function renderMessages(options){")
+    assert render_fn_idx != -1
+    _prox = ui_js_content.find("\nfunction ", render_fn_idx + 1)
+    render_tail = ui_js_content[render_fn_idx : _prox if _prox != -1 else render_fn_idx + 120000]
+
+    cache_capture = "const cacheHtml=inner.innerHTML;"
+    highlight_call = "if(typeof highlightCode==='function') highlightCode(inner);"
+    tree_init_call = "if(typeof initTreeViews==='function') initTreeViews(inner);"
+    copy_btn_call = "if(typeof addCopyButtons==='function') addCopyButtons(inner);"
+    cache_store = "const _html=cacheHtml;"
+
+    assert cache_capture in render_tail, "renderMessages must snapshot inner.innerHTML into cacheHtml before synchronous passes"
+    assert highlight_call in render_tail
+    assert tree_init_call in render_tail
+    assert copy_btn_call in render_tail
+    assert cache_store in render_tail, "renderMessages must store cacheHtml into _sessionHtmlCache"
+
+    cap_pos = render_tail.rfind(cache_capture)
+    hl_pos = render_tail.rfind(highlight_call)
+    store_pos = render_tail.rfind(cache_store)
+
+    assert cap_pos < hl_pos < store_pos, "cacheHtml must be captured before highlightCode and stored in _sessionHtmlCache"
 
 
 def test_cached_session_restore_runs_highlight_synchronously(ui_js_content):

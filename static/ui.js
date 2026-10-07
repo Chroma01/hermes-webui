@@ -20060,6 +20060,7 @@ function renderMessages(options){
   // (tool completion, session switch) must not override the user's scroll position.
   // scrollIfPinned() respects _scrollPinned, so it's a no-op if user scrolled up.
   if(typeof _syncLiveRunStatusAfterRender==='function') _syncLiveRunStatusAfterRender();
+  const cacheHtml=inner.innerHTML;
   // Synchronously highlight code blocks, initialize structured tree views, and attach
   // copy buttons BEFORE the frame is painted so virtualized transcripts do not paint
   // unhighlighted raw text for one frame when scrolled into view (#7752).
@@ -20088,7 +20089,7 @@ function renderMessages(options){
   // the helper) working — absent helper == not armed == cache normally.
   const _keepOpenArmed=(typeof _isKeepSettledWorklogOpenArmed==='function')&&_isKeepSettledWorklogOpenArmed();
   if(sid&&!INFLIGHT[sid]&&!hasTransientTranscriptUi&&!_keepOpenArmed){
-    const _html=inner.innerHTML;
+    const _html=cacheHtml;
     // Only cache sessions with <300KB rendered HTML; evict oldest beyond 8 sessions.
     if(_html.length<300_000){
       const renderSignature=cachedRenderSignature===null?_messageRenderCacheSignature():cachedRenderSignature;
