@@ -48,6 +48,11 @@ WHAT IT CHECKS
     above or below it, at every 20px list position that shows the row: the
     five rows show whole and do not scroll, slid up over the anchor from the
     bottom of the screen only as far as they must.
+  - an open picker follows a resize: after a window is made shorter (opened
+    at the top, the middle and the bottom of the list, and once more after a
+    sidebar repaint replaced the row it was opened from), a phone is turned
+    on its side and a tablet is turned, every row can still be tapped and the
+    picker still lines up with its anchor.
   the same list of conversations and fifteen projects
   - with a mouse, a wheel over the open batch picker scrolls the conversation
     list: the picker sits in that list and must not take the scroll;
@@ -943,6 +948,113 @@ def _check_tall_anchor(page, seed, size, *, long_list):
     return failures
 
 
+# Opens the picker and leaves it open: from the row on a phone, as a long press
+# does, from the row's ⋮ trigger with a mouse.
+OPEN_AND_LEAVE_JS = """({sid, mobile}) => {
+  const row = document.querySelector('.session-item[data-sid="' + sid + '"]');
+  const anchor = row && (mobile ? row : row.querySelector('.session-actions-trigger'));
+  const session = _allSessions.find(s => s && s.session_id === sid);
+  if (!anchor || !session) return false;
+  _showProjectPicker(session, anchor);
+  return !!document.querySelector('.project-picker:not(.batch-project-picker)');
+}"""
+
+# The picker that is already open: can every row be tapped where it now is, and
+# does it still end at its anchor's right edge?
+OPEN_PICKER_JS = """({sid, mobile}) => {
+  const picker = document.querySelector('.project-picker:not(.batch-project-picker)');
+  if (!picker) return {problem: 'the picker is no longer open'};
+  const row = document.querySelector('.session-item[data-sid="' + sid + '"]');
+  const anchor = row && (mobile ? row : row.querySelector('.session-actions-trigger'));
+  const unreachable = [];
+  const items = Array.from(picker.querySelectorAll('.project-picker-item'));
+  for (const item of items) {
+    item.scrollIntoView({block: 'nearest'});
+    const rect = item.getBoundingClientRect();
+    const hit = document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
+    if (!hit || !(hit === item || item.contains(hit))) unreachable.push(item.textContent.trim());
+  }
+  const box = picker.getBoundingClientRect();
+  return {
+    rows: items.length, unreachable,
+    top: Math.round(box.top), bottom: Math.round(box.bottom), viewport: innerHeight,
+    left: Math.round(box.left), right: Math.round(box.right),
+    anchorRight: anchor ? Math.round(anchor.getBoundingClientRect().right) : null,
+    anchorOnScreen: !!anchor && (r => r.left >= 0 && r.top >= 0 && r.bottom <= innerHeight)(anchor.getBoundingClientRect()),
+  };
+}"""
+
+# (what, viewport, touch, which conversation on screen, the viewport afterwards, repaint first)
+RESIZES = (
+    ("a window made shorter, opened at the bottom", (1440, 900), False, "last", (1440, 420), False),
+    ("a window made shorter, opened in the middle", (1440, 900), False, "middle", (1440, 420), False),
+    # From the first conversation, which is still on screen afterwards to line up with.
+    ("a window made shorter, opened at the top", (1440, 900), False, "first", (1440, 420), False),
+    ("a window made shorter after a sidebar repaint", (1440, 900), False, "first", (1440, 420), True),
+    ("a phone turned on its side, opened at the bottom", (390, 844), True, "last", (844, 390), False),
+    ("a tablet turned on its side, opened in the middle", (820, 1180), True, "middle", (1180, 820), False),
+)
+
+
+def _check_resize(browser):
+    """An open picker follows a resize or a rotation, as the ⋮ menu does: every row
+    can still be tapped, also when the sidebar was repainted in between and the
+    row it was opened from is a new element."""
+    failures = []
+    for what, before, touch, which, after, repaint in RESIZES:
+        ctx, page, errors = _new_page(
+            browser, viewport={"width": before[0], "height": before[1]}, has_touch=touch, is_mobile=touch
+        )
+        if page is None:
+            failures.append(f"  [resize] {what}: {errors}")
+            continue
+        if touch:
+            _open_mobile_drawer(page)
+        page.evaluate("renderSessionList()")
+        page.wait_for_timeout(SETTLE_MS)
+        page.evaluate(FIRST_CONVERSATION_TO_TOP_JS)
+        page.wait_for_timeout(200)
+        visible = page.evaluate(VISIBLE_ROWS_JS)
+        if len(visible) < 3:
+            failures.append(f"  [resize] {what}: only {len(visible)} conversations are on screen")
+            ctx.close()
+            continue
+        index = {"first": 0, "middle": len(visible) // 2, "last": -1}[which]
+        target = {"sid": visible[index], "mobile": touch}
+        if not page.evaluate(OPEN_AND_LEAVE_JS, target):
+            failures.append(f"  [resize] {what}: the picker did not open")
+            ctx.close()
+            continue
+        if repaint:
+            page.evaluate("renderSessionListFromCache()")
+        page.set_viewport_size({"width": after[0], "height": after[1]})
+        page.wait_for_timeout(400)
+        state = page.evaluate(OPEN_PICKER_JS, target)
+        if state.get("problem"):
+            failures.append(f"  [resize] {what}: {state['problem']}")
+        elif which == "first" and not state["anchorOnScreen"]:
+            failures.append(f"  [resize] {what}: the first conversation is no longer on screen to line up with")
+        else:
+            if state["top"] < 0 or state["bottom"] > state["viewport"] or state["unreachable"]:
+                failures.append(
+                    f"  [resize] {what}: the picker spans y={state['top']}..{state['bottom']} of"
+                    f" {state['viewport']} and {len(state['unreachable'])} of {state['rows']} rows cannot be tapped"
+                )
+            # Its right edge on its anchor's, or its left edge on the margin when it is wider than
+            # that leaves room for. Turning a phone closes its drawer and takes the row off the
+            # screen: nothing to line up with then.
+            if state["anchorOnScreen"]:
+                wanted = max(8, state["anchorRight"] - (state["right"] - state["left"]))
+                if abs(state["left"] - wanted) > 2:
+                    failures.append(
+                        f"  [resize] {what}: the picker starts at x={state['left']}, not x={wanted},"
+                        f" where its anchor (right edge x={state['anchorRight']}) puts it"
+                    )
+        failures.extend(f"  [resize] {what}: pageerror: {err}" for err in errors)
+        ctx.close()
+    return failures
+
+
 # Opens the batch picker for two conversations and measures it in one step: a
 # background sidebar refresh rebuilds the selection bar at any time.
 BATCH_ON_TOUCH_JS = """({alpha, beta}) => {
@@ -1212,6 +1324,12 @@ def main():
                     print(f"OK  tall anchor, short list {size} — all five rows show without scrolling, at every list position")
                 failures.extend(f"  [tall anchor, short list {size}] pageerror: {err}" for err in errors)
                 ctx.close()
+
+            # Still three projects, and the long list of conversations.
+            found = _check_resize(browser)
+            failures.extend(found)
+            if not found:
+                print("OK  resize — an open picker follows a shorter window and a rotation, also after a repaint")
 
             ctx, page, errors = _new_page(browser, viewport={"width": 1440, "height": 420})
             if page is None:

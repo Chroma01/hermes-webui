@@ -529,3 +529,20 @@ def test_single_picker_is_placed_as_the_session_action_menu_is():
     ):
         assert line in block, line
     assert "_pickerRoom" not in js and "spaceBelow<160" not in js
+
+
+def test_an_open_single_picker_is_placed_again_on_resize():
+    """Gate 2026-10-07, second pass: the placement wrote a fixed `top` once, so a shorter
+    window or a turned phone left an open picker off the screen. The ⋮ menu it mirrors is
+    placed again on resize; so is the picker now, by the row its conversation has by then."""
+    js = (Path(__file__).resolve().parent.parent / "static" / "sessions.js").read_text(encoding="utf-8")
+    show = _between(js, "function _showProjectPicker(session, anchorEl){", "\nfunction ")
+    assert "_positionProjectPicker(picker,anchorEl);" in show
+    assert "_openProjectPicker={picker,anchorEl,sessionId:session.session_id};" in show
+    assert "picker.style.top=" not in show
+    listener = _between(js, "let _openProjectPicker=null;", "// ── Project picker rows and keyboard")
+    hook = listener[listener.index("window.addEventListener('resize',()=>{"):]
+    assert "if(!open.picker.isConnected){" in hook
+    assert "anchor=_findSessionRenameRow(open.sessionId);" in hook
+    assert "_projectPickerFocusReturnTarget({session_id:open.sessionId},null)||anchor" in hook
+    assert "if(anchor) _positionProjectPicker(open.picker,anchor);" in hook

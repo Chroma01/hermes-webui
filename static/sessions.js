@@ -10080,9 +10080,30 @@ function _showProjectPicker(session, anchorEl){
   // Append to body and position using getBoundingClientRect so it isn't clipped
   // by overflow:hidden on .session-item ancestors
   document.body.appendChild(picker);
-  const rect=anchorEl.getBoundingClientRect();
   picker.style.position='fixed';
   picker.style.zIndex='999';
+  _positionProjectPicker(picker,anchorEl);
+  _openProjectPicker={picker,anchorEl,sessionId:session.session_id};
+  // Close on outside click
+  const close=(e)=>{if(!picker.contains(e.target)&&e.target!==anchorEl){picker.remove();document.removeEventListener('click',close);}};
+  setTimeout(()=>document.addEventListener('click',close),0);
+  // Keyboard (#8044): arrows move between the rows, Escape closes the picker
+  // and hands focus back to the conversation's ⋮ trigger.
+  picker.setAttribute('aria-label',t('session_move_project'));
+  _wireProjectPickerKeys(picker,()=>{
+    picker.remove();
+    document.removeEventListener('click',close);
+    _focusSessionActionMenuRestoreTarget(_projectPickerFocusReturnTarget(session,anchorEl));
+  });
+  _focusProjectPickerItem(picker);
+}
+
+// The open single-conversation picker, for the resize listener below. A closed
+// picker is found out by being detached, so no close path has to clear this.
+let _openProjectPicker=null;
+
+function _positionProjectPicker(picker, anchorEl){
+  const rect=anchorEl.getBoundingClientRect();
   // Placed as _positionSessionActionMenu places the ⋮ menu: below the anchor,
   // above it when that fits whole, else slid up over the anchor until it fits.
   // Natural height first (the CSS already caps it at 100dvh - 16px).
@@ -10108,19 +10129,28 @@ function _showProjectPicker(session, anchorEl){
   let left=rect.right-pickerW;
   if(left<8) left=8;
   picker.style.left=left+'px';
-  // Close on outside click
-  const close=(e)=>{if(!picker.contains(e.target)&&e.target!==anchorEl){picker.remove();document.removeEventListener('click',close);}};
-  setTimeout(()=>document.addEventListener('click',close),0);
-  // Keyboard (#8044): arrows move between the rows, Escape closes the picker
-  // and hands focus back to the conversation's ⋮ trigger.
-  picker.setAttribute('aria-label',t('session_move_project'));
-  _wireProjectPickerKeys(picker,()=>{
-    picker.remove();
-    document.removeEventListener('click',close);
-    _focusSessionActionMenuRestoreTarget(_projectPickerFocusReturnTarget(session,anchorEl));
-  });
-  _focusProjectPickerItem(picker);
 }
+
+// An open picker follows a resize or a rotation, as the ⋮ menu does. A sidebar
+// repaint may have replaced the row it was opened from: place it by the row
+// that conversation has now.
+window.addEventListener('resize',()=>{
+  const open=_openProjectPicker;
+  if(!open) return;
+  if(!open.picker.isConnected){
+    _openProjectPicker=null;
+    return;
+  }
+  let anchor=open.anchorEl;
+  if(!anchor.isConnected){
+    // The row for a long press, the row's own ⋮ trigger for a picker opened from one.
+    anchor=_findSessionRenameRow(open.sessionId);
+    if(anchor&&open.anchorEl.classList.contains('session-actions-trigger')){
+      anchor=_projectPickerFocusReturnTarget({session_id:open.sessionId},null)||anchor;
+    }
+  }
+  if(anchor) _positionProjectPicker(open.picker,anchor);
+});
 
 // ── Project picker rows and keyboard (#8044) ────────────────────────────
 // A picker row is a real button, so Tab reaches it and Enter/Space activate
