@@ -50,9 +50,11 @@ WHAT IT CHECKS
     bottom of the screen only as far as they must.
   - an open picker follows a resize: after a window is made shorter (opened
     at the top, the middle and the bottom of the list, and once more after a
-    sidebar repaint replaced the row it was opened from), a phone is turned
-    on its side and a tablet is turned, every row can still be tapped and the
-    picker still lines up with its anchor.
+    sidebar repaint replaced the row it was opened from) and a tablet is
+    turned, every row can still be tapped and the picker still lines up with
+    its anchor;
+  - a phone turned on its side closes its drawer and collapses the sidebar:
+    the picker closes with it instead of floating over the composer.
   the same list of conversations and fifteen projects, with a mouse
   - a list that fits a 900px-tall window and not a 420px one: after the
     resize the row the keyboard was on is inside the picker's box.
@@ -994,9 +996,62 @@ RESIZES = (
     # From the first conversation, which is still on screen afterwards to line up with.
     ("a window made shorter, opened at the top", (1440, 900), False, "first", (1440, 420), False),
     ("a window made shorter after a sidebar repaint", (1440, 900), False, "first", (1440, 420), True),
-    ("a phone turned on its side, opened at the bottom", (390, 844), True, "last", (844, 390), False),
     ("a tablet turned on its side, opened in the middle", (820, 1180), True, "middle", (1180, 820), False),
 )
+# Turning a phone crosses the width at which the drawer closes and the sidebar
+# collapses: the row the picker was opened from is hidden, and so the picker closes.
+ROTATIONS_THAT_HIDE_THE_SIDEBAR = (
+    ("a phone turned on its side, opened at the bottom", (390, 844), "last", (844, 390)),
+    ("a phone turned on its side, opened in the middle", (390, 844), "middle", (844, 390)),
+)
+
+AFTER_HIDING_JS = """() => {
+  const active = document.activeElement;
+  const sidebar = document.querySelector('.sidebar');
+  return {
+    pickers: document.querySelectorAll('.project-picker').length,
+    collapsed: document.querySelector('.layout').classList.contains('sidebar-collapsed'),
+    sidebarVisibility: sidebar ? getComputedStyle(sidebar).visibility : null,
+    focus: active ? active.tagName + (active.className ? '.' + String(active.className).split(' ')[0] : '') : null,
+    focusInPicker: !!(active && active.closest && active.closest('.project-picker')),
+  };
+}"""
+
+
+def _check_rotation_closes(browser):
+    failures = []
+    for what, before, which, after in ROTATIONS_THAT_HIDE_THE_SIDEBAR:
+        ctx, page, errors = _new_page(
+            browser, viewport={"width": before[0], "height": before[1]}, has_touch=True, is_mobile=True
+        )
+        if page is None:
+            failures.append(f"  [resize] {what}: {errors}")
+            continue
+        _open_mobile_drawer(page)
+        page.evaluate("renderSessionList()")
+        page.wait_for_timeout(SETTLE_MS)
+        visible = page.evaluate(VISIBLE_ROWS_JS)
+        if len(visible) < 3:
+            failures.append(f"  [resize] {what}: only {len(visible)} conversations are on screen")
+            ctx.close()
+            continue
+        index = {"middle": len(visible) // 2, "last": -1}[which]
+        if not page.evaluate(OPEN_AND_LEAVE_JS, {"sid": visible[index], "mobile": True}):
+            failures.append(f"  [resize] {what}: the picker did not open")
+            ctx.close()
+            continue
+        page.set_viewport_size({"width": after[0], "height": after[1]})
+        page.wait_for_timeout(600)
+        state = page.evaluate(AFTER_HIDING_JS)
+        if not state["collapsed"] or state["sidebarVisibility"] != "hidden":
+            failures.append(f"  [resize] {what}: the sidebar was expected to collapse, and did not ({state})")
+        if state["pickers"]:
+            failures.append(f"  [resize] {what}: the picker is still open over a hidden sidebar")
+        if state["focusInPicker"]:
+            failures.append(f"  [resize] {what}: focus is still inside the picker ({state['focus']})")
+        failures.extend(f"  [resize] {what}: pageerror: {err}" for err in errors)
+        ctx.close()
+    return failures
 
 
 def _check_resize(browser):
@@ -1364,10 +1419,10 @@ def main():
                 ctx.close()
 
             # Still three projects, and the long list of conversations.
-            found = _check_resize(browser)
+            found = _check_resize(browser) + _check_rotation_closes(browser)
             failures.extend(found)
             if not found:
-                print("OK  resize — an open picker follows a shorter window and a rotation, also after a repaint")
+                print("OK  resize — an open picker follows a shorter window and a turned tablet, and closes when a turned phone hides the sidebar")
 
             ctx, page, errors = _new_page(browser, viewport={"width": 1440, "height": 420})
             if page is None:

@@ -538,13 +538,20 @@ def test_an_open_single_picker_is_placed_again_on_resize():
     js = (Path(__file__).resolve().parent.parent / "static" / "sessions.js").read_text(encoding="utf-8")
     show = _between(js, "function _showProjectPicker(session, anchorEl){", "\nfunction ")
     assert "_positionProjectPicker(picker,anchorEl);" in show
-    assert "_openProjectPicker={picker,anchorEl,sessionId:session.session_id};" in show
+    assert "_wireProjectPickerKeys(picker,dismiss);" in show
+    assert "_openProjectPicker={picker,anchorEl,sessionId:session.session_id,dismiss};" in show
     assert "picker.style.top=" not in show
     listener = _between(js, "let _openProjectPicker=null;", "// ── Project picker rows and keyboard")
     hook = listener[listener.index("window.addEventListener('resize',()=>{"):]
     assert "if(!open.picker.isConnected){" in hook
     assert "anchor=_findSessionRenameRow(open.sessionId);" in hook
     assert "_projectPickerFocusReturnTarget({session_id:open.sessionId},null)||anchor" in hook
-    assert "if(anchor) _positionProjectPicker(open.picker,anchor);" in hook
+    assert "_positionProjectPicker(open.picker,anchor);" in hook
+    # Maintainer 2026-10-07: a turned phone hides the sidebar, and the picker floated over
+    # the composer. Decided a frame later, after boot.js's own resize listener collapsed it.
+    assert "requestAnimationFrame(()=>{" in hook
+    hidden = "if(!anchor||!anchor.offsetParent||anchor.closest('.layout.sidebar-collapsed .sidebar:not(.mobile-open)')){"
+    assert hidden in hook
+    assert hook.index(hidden) < hook.index("open.dismiss();") < hook.index("_positionProjectPicker(open.picker,anchor);")
     # Greptile 2026-10-07: the cap a shorter window puts on the picker can cover the focused row.
     assert "if(focused&&open.picker.contains(focused)) _focusProjectPickerRow(open.picker,focused);" in hook

@@ -10083,18 +10083,19 @@ function _showProjectPicker(session, anchorEl){
   picker.style.position='fixed';
   picker.style.zIndex='999';
   _positionProjectPicker(picker,anchorEl);
-  _openProjectPicker={picker,anchorEl,sessionId:session.session_id};
   // Close on outside click
   const close=(e)=>{if(!picker.contains(e.target)&&e.target!==anchorEl){picker.remove();document.removeEventListener('click',close);}};
   setTimeout(()=>document.addEventListener('click',close),0);
   // Keyboard (#8044): arrows move between the rows, Escape closes the picker
   // and hands focus back to the conversation's ⋮ trigger.
   picker.setAttribute('aria-label',t('session_move_project'));
-  _wireProjectPickerKeys(picker,()=>{
+  const dismiss=()=>{
     picker.remove();
     document.removeEventListener('click',close);
     _focusSessionActionMenuRestoreTarget(_projectPickerFocusReturnTarget(session,anchorEl));
-  });
+  };
+  _wireProjectPickerKeys(picker,dismiss);
+  _openProjectPicker={picker,anchorEl,sessionId:session.session_id,dismiss};
   _focusProjectPickerItem(picker);
 }
 
@@ -10141,18 +10142,30 @@ window.addEventListener('resize',()=>{
     _openProjectPicker=null;
     return;
   }
-  let anchor=open.anchorEl;
-  if(!anchor.isConnected){
-    // The row for a long press, the row's own ⋮ trigger for a picker opened from one.
-    anchor=_findSessionRenameRow(open.sessionId);
-    if(anchor&&open.anchorEl.classList.contains('session-actions-trigger')){
-      anchor=_projectPickerFocusReturnTarget({session_id:open.sessionId},null)||anchor;
+  // On the next frame: boot.js collapses the sidebar in a resize listener of
+  // its own, which runs after this one.
+  requestAnimationFrame(()=>{
+    if(!open.picker.isConnected) return;
+    let anchor=open.anchorEl;
+    if(!anchor.isConnected){
+      // The row for a long press, the row's own ⋮ trigger for a picker opened from one.
+      anchor=_findSessionRenameRow(open.sessionId);
+      if(anchor&&open.anchorEl.classList.contains('session-actions-trigger')){
+        anchor=_projectPickerFocusReturnTarget({session_id:open.sessionId},null)||anchor;
+      }
     }
-  }
-  if(anchor) _positionProjectPicker(open.picker,anchor);
-  // A shorter window can cap the picker's height over the row the keyboard is on.
-  const focused=document.activeElement;
-  if(focused&&open.picker.contains(focused)) _focusProjectPickerRow(open.picker,focused);
+    // A turned phone closes the drawer and collapses the sidebar. The row is
+    // then still laid out, inside a sidebar of no width that turns invisible
+    // 200ms later, so the collapsed state is read from the classes that hide it.
+    if(!anchor||!anchor.offsetParent||anchor.closest('.layout.sidebar-collapsed .sidebar:not(.mobile-open)')){
+      open.dismiss();
+      return;
+    }
+    _positionProjectPicker(open.picker,anchor);
+    // A shorter window can cap the picker's height over the row the keyboard is on.
+    const focused=document.activeElement;
+    if(focused&&open.picker.contains(focused)) _focusProjectPickerRow(open.picker,focused);
+  });
 });
 
 // ── Project picker rows and keyboard (#8044) ────────────────────────────
