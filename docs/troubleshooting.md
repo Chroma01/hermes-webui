@@ -128,6 +128,17 @@ startup. If a restart fails, inspect the current service journal and selected
 interpreter. This ordering repair does not remove the static fallback lock or
 change cross-profile credential handling.
 
+The native Windows launcher also decides *which* Agent root that bootstrap runs
+from, so the two have to agree. `start.ps1` normally keeps the source-first
+order from `api.config._discover_agent_dir`, but it repairs a few displaced
+layouts: a bare source checkout, the repo sibling, an Agent root (source or
+pip-style) at the repo parent, or `%USERPROFILE%\hermes-agent`, when that selection has no in-root
+venv and a later master-order install exists. For the layout-fallback cases the
+install may win even without its own venv (deps already importable); otherwise
+the install needs a `venv\Scripts\python.exe`. A source checkout that has its
+own venv keeps priority, since it is launchable on its own.
+`HERMES_WEBUI_AGENT_DIR` remains authoritative over both.
+
 Current Hermes managed environments ship `ruamel.yaml` and may not include
 PyYAML. WebUI reads and writes YAML through `api/yaml_compat.py`, which uses
 PyYAML when it is importable and falls back to `ruamel.yaml` otherwise, and the
@@ -315,12 +326,20 @@ python3 scripts/ensure_state_db_read_indexes.py --db ~/.hermes/state.db --confir
 ## Update check reports a Git authentication or fetch failure
 
 **Symptom.** The update status is stale or reports `fetch failed`, `Authentication failed`, or
-`could not read Username`. No terminal or desktop credential prompt appears.
+`could not read Username`, or `unable to get password from user` (Git 2.47+).
+Git's own prompts are disabled; credential-helper UI depends on the helper.
 
 **Why.** Update checks are unattended. WebUI removes inherited askpass, SSH-command, proxy, and Git
 config injection settings; disables checkout-controlled askpass and credential helpers; and forces
 SSH batch mode. Generic and URL-scoped credential helpers from trusted user and system Git config
-remain available when declared directly in the primary system/global files. `include` and
+remain available when declared directly in the primary system/global files.
+Git Credential Manager also receives `GCM_INTERACTIVE=never` and
+`credential.interactive=false`: cached credentials may authenticate a check, but a GCM cache miss
+must fail without opening its GUI or browser login. Git itself honors
+`credential.interactive` starting in 2.47; other credential helpers may ignore
+these controls and still open a browser or GUI. These controls follow
+[GCM's environment contract](https://github.com/git-ecosystem/git-credential-manager/blob/main/docs/environment.md#gcm_interactive)
+and [configuration contract](https://github.com/git-ecosystem/git-credential-manager/blob/main/docs/configuration.md#credentialinteractive). `include` and
 `includeIf` are not followed for credential helpers, `core.sshCommand`, or `ssh.variant`:
 included files may be checkout-controlled even when Git labels their scope global. Move these
 settings into the main user/system config if needed. The explicit scope reads also work on
