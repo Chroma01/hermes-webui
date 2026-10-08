@@ -2,7 +2,7 @@
 import hashlib
 import pytest
 from cryptography.hazmat.primitives.asymmetric import ec
-from test_passkey_auth import _set_paths, _client_data, FakeHandler, cbor, b64u
+from tests.test_passkey_auth import _set_paths, _client_data, FakeHandler, cbor, b64u
 
 
 def register(monkeypatch, tmp_path, flags, suffix):
@@ -29,6 +29,9 @@ def test_registration_accepts_extension_map(monkeypatch, tmp_path):
     (0xC1, cbor(1)),                # extension is not a map
     (0xC1, cbor({}) + b'\x00'),     # trailing data after extension
     (0xC1, b'\xa1'),               # truncated extension
+    (0xC1, b'\xa1\x80\x00'),       # unhashable map key
+    (0xC1, b'\xa1\x61\xff\x00'),   # invalid UTF-8 map key
+    (0xC1, b'\xa1\x61x' * 2000 + b'\x00'),  # excessive nesting
 ])
 def test_registration_rejects_invalid_extensions(monkeypatch, tmp_path, flags, suffix):
     from api.passkeys import PasskeyError

@@ -351,7 +351,10 @@ def finish_registration(payload: dict[str, Any], handler) -> dict[str, Any]:
     if not isinstance(cose_key, dict):
         raise PasskeyError("Malformed credential public key")
     if parsed["flags"] & 0x80:
-        extensions = parser.item()
+        try:
+            extensions = parser.item()
+        except (TypeError, ValueError, UnicodeDecodeError, RecursionError) as exc:
+            raise PasskeyError("Malformed authenticator extensions") from exc
         if not isinstance(extensions, dict):
             raise PasskeyError("Malformed authenticator extensions")
     if parser.pos != len(parser.data):
