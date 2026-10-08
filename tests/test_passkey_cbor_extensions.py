@@ -37,3 +37,43 @@ def test_registration_rejects_invalid_extensions(monkeypatch, tmp_path, flags, s
     from api.passkeys import PasskeyError
     with pytest.raises(PasskeyError):
         register(monkeypatch, tmp_path, flags, suffix)
+
+
+def register_raw(monkeypatch, tmp_path, cid, cose_bytes, declared_len=None, flags=0x41):
+    """Like register(), but with full control of the credential ID, its declared
+    length and the COSE key bytes (release gate: exercise the new credential guards)."""
+    passkeys = _set_paths(monkeypatch, tmp_path)
+    opts = passkeys.registration_options(FakeHandler())
+    _, client = _client_data('webauthn.create', opts['challenge'])
+    n = len(cid) if declared_len is None else declared_len
+    auth = (hashlib.sha256(opts['rp']['id'].encode()).digest() + bytes([flags])
+            + (1).to_bytes(4, 'big') + bytes(16) + n.to_bytes(2, 'big')
+            + cid + cose_bytes)
+    return passkeys.finish_registration({'response': {'clientDataJSON': client,
+        'attestationObject': b64u(cbor({'fmt': 'none', 'authData': auth, 'attStmt': {}}))}}, FakeHandler())
+
+
+def _valid_cose():
+    key = ec.generate_private_key(ec.SECP256R1()).public_key().public_numbers()
+    return cbor({1: 2, 3: -7, -1: 1, -2: key.x.to_bytes(32, 'big'), -3: key.y.to_bytes(32, 'big')})
+
+
+@pytest.mark.parametrize('case', ['empty_credential_id', 'declared_length_past_end', 'cose_key_not_a_map'])
+def test_registration_rejects_malformed_credential_data(monkeypatch, tmp_path, case):
+    """Greptile on release PR #8102: the new `cred_len` and non-map COSE-key guards
+    had no tests. Each malformed input must be a clean PasskeyError (a 4xx), never a
+    crash or a stored credential."""
+    from api.passkeys import PasskeyError
+    if case == 'empty_credential_id':
+        args = dict(cid=b'', cose_bytes=_valid_cose())
+    elif case == 'declared_length_past_end':
+        args = dict(cid=b'short-id', cose_bytes=b'', declared_len=500)
+    else:
+        args = dict(cid=b'extension-credential', cose_bytes=cbor([1, 2, 3]))
+    with pytest.raises(PasskeyError):
+        register_raw(monkeypatch, tmp_path, **args)
+
+
+def test_register_raw_accepts_a_valid_credential(monkeypatch, tmp_path):
+    """Control for the helper above: well-formed data still registers."""
+    assert register_raw(monkeypatch, tmp_path, b'extension-credential', _valid_cose())['ok']
