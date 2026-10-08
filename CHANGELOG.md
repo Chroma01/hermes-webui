@@ -138,6 +138,27 @@
 - **Passkey enrollment works with security keys that send extensions.** Registering a YubiKey or another
   authenticator that includes CBOR extension data no longer fails with "Trailing CBOR data"; malformed extension bytes
   are rejected cleanly instead of causing a server error. Existing passkeys keep working. Thanks @Dandandad. (#8093, #8092)
+
+- **A closed mobile sidebar or workspace drawer is out of the keyboard's way.** Once a drawer has slid closed it is
+  inert and hidden from the tab order and screen readers, so Tab no longer walks into an invisible off-screen list;
+  closing it by tapping outside or with its own close button returns focus to the control that opened it, and the
+  hidden file-upload input is no longer a stray tab stop. Thanks @happy5318. (#7924)
+
+- **Sending uses the model's own provider.** Picking a model now sends with that model's provider instead of a stale
+  provider left on the conversation, including qualified ids such as `provider:model`, new chats and conversations whose
+  provider was removed. Saving Settings and reopening them no longer brings back a phantom "unsaved changes" bar.
+  Thanks @happy5318. (#7865, #7860)
+
+- **OpenAI text-to-speech starts sooner and plays to the end.** Long replies are split into chunks that play as they
+  arrive instead of waiting for the whole clip; a rate-limited (429) chunk is retried without stopping playback, and
+  every chunk request (OpenAI and Edge) stays pinned to the profile the reply started on, even if you switch profiles
+  mid-reply. Thanks @happy5318. (#7529)
+
+- **Conversation titles recover after a bad model reply.** When the title model returns a list of options, a menu or
+  other unusable text, the WebUI now rejects it and keeps or regenerates a proper title instead of saving the junk.
+  Genuine titles with commas or two parts are kept. A title generated while you reconnected to a continued
+  conversation now reaches that conversation, a title you renamed by hand is never overwritten, and repeated bad
+  replies from a model are capped. Thanks @CharlesMcquade. (#7318)
 - **A workspace panel you closed stays closed.** On phones, the on-screen keyboard (a viewport resize) no longer
   reopens the workspace panel after you dismissed it. File and artifact previews are now owned by the open that started
   them: a slow preview that finishes after you switched conversations, opened another file or closed the panel no longer
