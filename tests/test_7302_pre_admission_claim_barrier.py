@@ -501,3 +501,172 @@ def test_the_real_launch_path_blocks_a_second_start_and_runs_its_worker(monkeypa
     assert routes._active_stream_blocks_chat_start(session, STREAM_ID) is True, (
         "after admission the guard must block on the live ACTIVE_RUNS worker row"
     )
+
+
+class _BlockingSaveSession(_LaunchSession):
+    """``s.save()`` parks inside the launch phase until the test releases it.
+
+    The regeneration site schedules its worker, then runs ``s.save()``, and only
+    then calls ``release_worker.set()``. Blocking the save on an ``Event`` holds
+    that window open with no timing at all, so the test -- not a sleep -- decides
+    when the worker is admitted. That is the maintainer's Oct 2 schedule.
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.save_started = threading.Event()
+        self.release_save = threading.Event()
+
+    def save(self, *args, **kwargs):
+        self.save_started.set()
+        self.release_save.wait(10)
+        return None
+
+
+def test_the_real_regeneration_launch_blocks_a_duplicate_start_and_admits_its_worker(
+    monkeypatch,
+):
+    """The maintainer's regeneration barrier, over the REAL regeneration path.
+
+    His Oct 2 case: the regeneration site holds its worker at
+    ``release_worker.wait()`` while ``s.save()`` runs, then a second ``chat/start``
+    arrives. The ordinary-start barrier above drives admission with a thread stub
+    that never runs its body plus a hand-made ``ACTIVE_RUNS`` row -- "admission
+    simulated". Here ``threading.Thread`` is the real one, the worker reaches its
+    own admission step, and the two-sided requirement ("the second start must stay
+    blocked and the first worker must run") is asserted over this path.
+    """
+    import types as _types
+
+    import api.session_ops as session_ops
+    import api.turn_journal as turn_journal
+
+    admitted = threading.Event()
+    seen = {}
+
+    def _admitting_worker(
+        session_id, msg_text, model, workspace, stream_id, attachments=None, **kwargs
+    ):
+        # What api/streaming.py does the moment its worker is admitted: publish the
+        # ACTIVE_RUNS row and retire the launch-phase claim.
+        config.register_active_run(
+            stream_id,
+            session_id=session_id,
+            started_at=time.time(),
+            phase="starting",
+        )
+        retire = getattr(config, "retire_pre_admission_claim_if_owned", None)
+        if retire is not None:
+            retire(stream_id)
+        seen["stream_id"] = stream_id
+        seen["msg"] = msg_text
+        admitted.set()
+
+    monkeypatch.setattr(routes, "_run_agent_streaming", _admitting_worker)
+    monkeypatch.setattr(
+        routes.uuid, "uuid4", lambda: _types.SimpleNamespace(hex=STREAM_ID)
+    )
+    monkeypatch.setattr(
+        routes, "_prepare_chat_start_session_for_stream", lambda *a, **k: None
+    )
+    monkeypatch.setattr(routes, "set_last_workspace", lambda *a, **k: None)
+    monkeypatch.setattr(
+        routes, "publish_session_list_changed", lambda *a, **k: None, raising=False
+    )
+    monkeypatch.setattr(
+        routes, "compression_recovery_payload_for_session", lambda s: None, raising=False
+    )
+    monkeypatch.setattr(
+        routes, "clear_compression_recovery", lambda s: None, raising=False
+    )
+    monkeypatch.setattr(turn_journal, "append_turn_journal_event", lambda *a, **k: {})
+    # The regeneration transaction itself is not what this test covers: stub its
+    # three steps so the assertion is about the launch phase, and leave the launch
+    # funnel (worker schedule, save, release) real.
+    turn = _types.SimpleNamespace(
+        revision=1, message_text="hello", attachments=[], source="webui"
+    )
+    monkeypatch.setattr(
+        session_ops,
+        "plan_regeneration",
+        lambda s, expected_revision, lock_held: _types.SimpleNamespace(turn=turn),
+    )
+    monkeypatch.setattr(session_ops, "snapshot_regeneration_state", lambda s: {})
+    monkeypatch.setattr(
+        session_ops,
+        "apply_regeneration_plan",
+        lambda s, plan, return_context_user=False: (True, None),
+    )
+
+    session = _BlockingSaveSession(
+        pending_age_seconds=_REPAIR_STALE_PENDING_GRACE_SECONDS + 5
+    )
+    session.messages = [_types.SimpleNamespace(role="user", text="hello")]
+
+    result = {}
+
+    def _launch():
+        try:
+            result["response"] = routes._start_regeneration_stream_locked(
+                session,
+                turn=turn,
+                workspace="test-workspace",
+                model="test-model",
+                model_provider="test-provider",
+                normalized_model=False,
+                diag=None,
+                goal_related=False,
+                source="webui",
+                moa_config=None,
+                backend_is_gateway=False,
+            )
+        except BaseException as exc:  # a dying launch thread must not look like success
+            result["error"] = exc
+
+    launcher = threading.Thread(target=_launch, daemon=True)
+    launcher.start()
+
+    # (1) The launch phase is open: the stream is registered and the save is still
+    # running, so the worker has been scheduled but not admitted.
+    assert session.save_started.wait(10), "the regeneration launch never reached s.save()"
+    assert STREAM_ID in config.STREAMS, (
+        "the regeneration launch did not register its stream"
+    )
+    assert not admitted.is_set(), (
+        "the worker ran its turn before the regeneration launch persisted its save"
+    )
+
+    # (2) The duplicate start stays blocked and the stream is kept, whatever the
+    # pending age. Pre-claim heads clear it here -- this is the RED.
+    assert routes._active_stream_blocks_chat_start(session, STREAM_ID) is True, (
+        "a second chat/start was admitted over the regeneration launch phase: the "
+        "first worker would exit without running its turn"
+    )
+    assert STREAM_ID in config.STREAMS, (
+        "the orphan check cleared a stream whose regeneration launch was still in flight"
+    )
+    assert STREAM_ID in getattr(config, "PRE_ADMISSION_CLAIMS", {}), (
+        "the regeneration launch registered a stream with no launch-phase claim: the "
+        "orphan check clears a stream that is still launching"
+    )
+
+    # (3) Release the launch -> the real worker is admitted.
+    session.release_save.set()
+    assert admitted.wait(10), "the regenerated turn's worker was never admitted"
+    launcher.join(10)
+    assert "error" not in result, result.get("error")
+    assert seen["stream_id"] == STREAM_ID, (
+        "the admitted worker does not carry this stream id, so it would run a turn "
+        "the duplicate start was trying to take over"
+    )
+    assert result["response"]["stream_id"] == STREAM_ID
+    assert STREAM_ID not in getattr(config, "PRE_ADMISSION_CLAIMS", {}), (
+        "the launch-phase claim survived worker admission: a dead stream would then "
+        "be kept alive forever by a claim nobody retires"
+    )
+
+    # (4) After admission the liveness lives in ACTIVE_RUNS, so the guard blocks on
+    # the worker row rather than on the retired claim.
+    assert routes._active_stream_blocks_chat_start(session, STREAM_ID) is True, (
+        "after admission the guard must block on the live ACTIVE_RUNS worker row"
+    )
