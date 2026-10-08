@@ -135,6 +135,9 @@
 
 ### Fixed
 
+- **Passkey enrollment works with security keys that send extensions.** Registering a YubiKey or another
+  authenticator that includes CBOR extension data no longer fails with "Trailing CBOR data"; malformed extension bytes
+  are rejected cleanly instead of causing a server error. Existing passkeys keep working. Thanks @Dandandad. (#8093, #8092)
 - **A workspace panel you closed stays closed.** On phones, the on-screen keyboard (a viewport resize) no longer
   reopens the workspace panel after you dismissed it. File and artifact previews are now owned by the open that started
   them: a slow preview that finishes after you switched conversations, opened another file or closed the panel no longer
