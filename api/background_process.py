@@ -298,10 +298,12 @@ class SessionChannel:
              the response, and the browser's ``EventSource`` auto-reconnects.
           3. Idempotent: a second call signals nobody and returns 0.
 
-        Signals are sent OUTSIDE ``self._lock`` (same shape as ``emit``) so a
-        queue whose ``put_nowait`` blocks on a slow consumer can never hold the
-        channel lock. A saturated queue cannot accept the sentinel, so one
-        stale entry is evicted first to guarantee the sentinel lands.
+        Signals are sent OUTSIDE ``self._lock`` -- unlike ``emit()``, which holds
+        the lock across each subscriber's ``put_nowait`` so its stall record
+        cannot go stale (re-gate finding 4) -- so a queue whose ``put_nowait``
+        blocks on a slow consumer can never hold the channel lock. A saturated
+        queue cannot accept the sentinel, so one stale entry is evicted first to
+        guarantee the sentinel lands.
 
         Returns the number of subscribers that received the sentinel.
         """
@@ -854,8 +856,10 @@ def _reaper_loop() -> None:
             # is one notion of "orphan" in the codebase.
             #
             # Lock order: snapshot ACTIVE_RUNS under ACTIVE_RUNS_LOCK BEFORE taking
-            # STREAMS_LOCK (the order _emit_to_session_streams documents) so the two
-            # independent locks are never nested. is_orphaned_stream() then
+            # STREAMS_LOCK, so this sweep never takes them in the reverse order.
+            # ``STREAMS_LOCK`` -> ``ACTIVE_RUNS_LOCK`` is the documented one
+            # (docs/architecture/session-channel-lifecycle.md); the two locks are
+            # not "independent" any more. is_orphaned_stream() then
             # re-validates, including the launch-phase claim -- without that check
             # this sweep would reap a stream that is still launching and
             # reintroduce finding 5 through the back door.
@@ -2213,7 +2217,8 @@ def _session_has_active_turn(session_id: str) -> bool:
 
     # Pre-ACTIVE_RUNS publication window (#6959 gate): the agent worker
     # publishes its stream — register_stream_owner() first, then the live
-    # STREAMS channel — BEFORE it registers in ACTIVE_RUNS. In that window a
+    # STREAMS channel, with its launch-phase claim published in that same
+    # STREAMS_LOCK section — BEFORE it registers in ACTIVE_RUNS. In that window a
     # same-session live STREAMS entry means a turn is already (or about to be)
     # active, so it must count here: otherwise a sibling async-delegation
     # completion would pass the busy pre-check, reserve the per-origin
