@@ -60,7 +60,7 @@ def test_session_html_cache_preserves_pre_highlight_markup(ui_js_content):
     _prox = ui_js_content.find("\nfunction ", render_fn_idx + 1)
     render_tail = ui_js_content[render_fn_idx : _prox if _prox != -1 else render_fn_idx + 120000]
 
-    cache_capture = "const cacheHtml=inner.innerHTML;"
+    cache_capture = "cacheHtml=inner.innerHTML;"
     highlight_call = "if(typeof highlightCode==='function') highlightCode(inner);"
     tree_init_call = "if(typeof initTreeViews==='function') initTreeViews(inner);"
     copy_btn_call = "if(typeof addCopyButtons==='function') addCopyButtons(inner);"
