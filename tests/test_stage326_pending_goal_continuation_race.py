@@ -139,18 +139,24 @@ def test_stream_goal_related_release_is_keyed_by_stream_id():
     config.STREAM_GOAL_RELATED[ending_stream] = True
     config.STREAM_GOAL_RELATED[other_stream] = True
 
-    config.release_stream_owned_registries(ending_stream, session_id=session_id)
+    try:
+        config.release_stream_owned_registries(ending_stream, session_id=session_id)
 
-    assert ending_stream not in config.STREAM_GOAL_RELATED, (
-        "the ending stream's classification must be released"
-    )
-    assert config.STREAM_GOAL_RELATED.get(other_stream) is True, (
-        "releasing one stream must leave the other stream's goal classification "
-        "on the same session intact"
-    )
-    assert other_stream in config.STREAM_SESSION_OWNERS, (
-        "releasing one stream must not unregister another stream's owner"
-    )
+        assert ending_stream not in config.STREAM_GOAL_RELATED, (
+            "the ending stream's classification must be released"
+        )
+        assert config.STREAM_GOAL_RELATED.get(other_stream) is True, (
+            "releasing one stream must leave the other stream's goal classification "
+            "on the same session intact"
+        )
+        assert other_stream in config.STREAM_SESSION_OWNERS, (
+            "releasing one stream must not unregister another stream's owner"
+        )
+    finally:
+        # Greptile on #8108: release both streams so no shared registry entry leaks.
+        for sid in (ending_stream, other_stream):
+            config.release_stream_owned_registries(sid, session_id=session_id)
+            config.STREAM_GOAL_RELATED.pop(sid, None)
 
 
 def test_goal_continue_set_marker_before_emitting_event():

@@ -116,8 +116,16 @@ def test_a_subscriber_that_kept_proving_itself_is_never_collected():
         "a subscriber that proved itself to the writer was collected anyway: a "
         "healthy but quiet tab loses its channel"
     )
-    assert bp.get_session_channel(SESSION_ID) is ch
-    assert ch.closed is False
+    try:
+        assert bp.get_session_channel(SESSION_ID) is ch
+        assert ch.closed is False
+    finally:
+        # Greptile on #8108: don't leave a live subscribed channel in the shared
+        # registry for later tests.
+        ch.unsubscribe(q)
+        ch.close("test cleanup")
+        with bp.SESSION_CHANNELS_LOCK:
+            bp.SESSION_CHANNELS.pop(SESSION_ID, None)
 
 
 @_REQUIRES_WRITER_LIVENESS
