@@ -3871,7 +3871,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
           if(_anchorSceneRowTextOverlapsExisting(textKey,seenTextKeys)) return;
           seenTextKeys.push(textKey);
         }else if(textKey.length>=80){
-          // For ID'd rows, only the ≥80 char near-overlap leg applies
+          // For rows that carry a durable ID, only the >=80 char near-overlap leg applies
           if(_anchorSceneRowTextOverlapsExisting(textKey,seenTextKeys)) return;
         }
       }
