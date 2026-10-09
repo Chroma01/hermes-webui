@@ -58,9 +58,11 @@ The startup banner prints which Python and agent dir it resolved. If the agent d
 
 ```bash
 export HERMES_WEBUI_AGENT_DIR=/absolute/path/to/hermes-agent
-export HERMES_WEBUI_PYTHON=/absolute/path/to/agent/venv/bin/python
+export HERMES_WEBUI_PYTHON=/absolute/path/to/working/python
 ./start.sh
 ```
+
+For a source checkout that path is the agent venv python (`.../hermes-agent/venv/bin/python`); for a package-managed install it is the committed generation's venv python from the resolver one-liner — not the pre-PM in-tree venv — see [Hermes package-managed runtime bootstrap order](#hermes-package-managed-runtime-bootstrap-order).
 
 ### Step 3 — install the agent in editable mode
 
@@ -96,7 +98,7 @@ from pydantic_core._pydantic_core import SchemaValidator        # compiled: fail
 print('ok')"
 ```
 
-`HERMES_DISABLE_LAZY_INSTALLS=1` keeps the agent's launch preparation from re-exec'ing this snippet into the store interpreter. If the bare probe printed `ok` but this one fails with `No module named 'pydantic_core._pydantic_core'`, the interpreter is on the wrong side of an ABI mismatch: fix the launcher's interpreter. Reinstalling or repairing `pydantic` changes nothing, because both environments are complete in isolation.
+`HERMES_DISABLE_LAZY_INSTALLS=1` keeps the agent's launch preparation from re-exec'ing this snippet into the store interpreter. Run this probe with the service's `HERMES_HOME` (and `HERMES_BASE_HOME`, when the service sets it) — otherwise it can resolve a different home's committed generation and report an unrelated pass or failure. If the bare probe printed `ok` but this one fails with `No module named 'pydantic_core._pydantic_core'`, the interpreter is on the wrong side of an ABI mismatch: fix the launcher's interpreter. Reinstalling or repairing `pydantic` changes nothing, because both environments are complete in isolation.
 
 If this fails, `import run_agent` itself is broken — check that the agent's pyproject.toml lists `run_agent` as a top-level module or that the agent dir is on PYTHONPATH:
 
