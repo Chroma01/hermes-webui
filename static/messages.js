@@ -3689,7 +3689,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       // ── same-identity enrichment: keep latest/richest value ──
       if(key&&seen.has(key)){
         const existingIdx=rows.findIndex(r=>_anchorSceneExistingRowKey(r)===key);
-        if(existingIdx>=0){
+        if(isTextual&&existingIdx>=0){
           rows[existingIdx]={...rows[existingIdx],...row,display_hint:_anchorSceneRowDisplayHintForMode(row,sceneMode)};
         }
         return;

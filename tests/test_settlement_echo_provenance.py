@@ -697,3 +697,58 @@ process.stdout.write(JSON.stringify(rows));
     assert [r["local_id"] for r in settled] == ["settled-prose:b"], (
         f"Exactly one settled echo (the second) must survive, got: {settled}"
     )
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_settlement_preserves_completed_tool_snapshot_metadata_against_sparse_transcript():
+    """Settlement must not shallowly overwrite a completed tool snapshot with a
+    sparse transcript row for the same tool ID: snippet, is_error, and started_at
+    must be preserved intact."""
+    script = (
+        _SETTLEMENT_JS_BOOT
+        + """
+function _anchorSceneRowsByMessageIndex(){ return new Map([
+  [1, [
+    {role:'tool', text:'run command', tool_call_id:'tc-exec', row_id:'r-tc', local_id:'tc-exec', status:'completed', snippet:'', is_error:false, started_at:null},
+  ]]
+]); }
+const messages = [
+  {role:'user', content:'Run script', id:'user-1'},
+  {role:'assistant', content:'Done', id:'asst-1'},
+];
+const projectedScene = {
+  mode:'compact_worklog',
+  final_answer:'Done',
+  identity:{source_message_refs:['asst-1']},
+  lifecycle:{},
+  activity_rows:[
+    {
+      role:'tool',
+      text:'run command',
+      tool_call_id:'tc-exec',
+      row_id:'r-tc',
+      local_id:'tc-exec',
+      status:'completed',
+      snippet:'Traceback: process failed with exit code 1',
+      is_error:true,
+      started_at:1700000000,
+    },
+  ]
+};
+const scene = _completeSettledAnchorSceneForTurn(messages, 1, projectedScene);
+const rows = scene && scene.activity_rows || [];
+process.stdout.write(JSON.stringify(rows));
+"""
+    )
+    rows = _run_node_script(script)
+    assert len(rows) == 1, f"Expected 1 tool row, got {len(rows)}: {rows}"
+    tool_row = rows[0]
+    assert tool_row["tool_call_id"] == "tc-exec"
+    assert tool_row["snippet"] == "Traceback: process failed with exit code 1", (
+        f"Tool snippet should be preserved, got: {tool_row.get('snippet')}"
+    )
+    assert tool_row["is_error"] is True, f"Tool is_error should remain True, got: {tool_row.get('is_error')}"
+    assert tool_row["started_at"] == 1700000000, (
+        f"Tool started_at should remain 1700000000, got: {tool_row.get('started_at')}"
+    )
+
