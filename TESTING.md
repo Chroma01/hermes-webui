@@ -157,8 +157,10 @@ row taller than the room beside it. A list the screen has room for must show
 whole without scrolling: below its anchor, else above it, else slid up over it
 from the bottom of the screen; and an open picker must follow a shorter window
 or a turned tablet, also after a sidebar repaint, keep the row the keyboard is
-on inside its box when the resize caps its height, and close when a turned
-phone hides the sidebar it was opened from (#8044). Run it locally with
+on inside its box when the resize caps its height, and close, without handing
+focus back, when the resize hides the sidebar it was opened from: a phone
+turned either way, or a window narrowed until the sidebar collapses or becomes
+a closed drawer (#8044). Run it locally with
 `python tests/browser_project_picker_keyboard.py`; add `--screenshots DIR` to
 write the open picker at 390x844, 820x1180, 844x390 and 1440x900.
 

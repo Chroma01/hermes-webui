@@ -550,8 +550,36 @@ def test_an_open_single_picker_is_placed_again_on_resize():
     # Maintainer 2026-10-07: a turned phone hides the sidebar, and the picker floated over
     # the composer. Decided a frame later, after boot.js's own resize listener collapsed it.
     assert "requestAnimationFrame(()=>{" in hook
-    hidden = "if(!anchor||!anchor.offsetParent||anchor.closest('.layout.sidebar-collapsed .sidebar:not(.mobile-open)')){"
+    hidden = "if(!anchor||!anchor.offsetParent||_projectPickerSidebarHidden(anchor)){"
     assert hidden in hook
-    assert hook.index(hidden) < hook.index("open.dismiss();") < hook.index("_positionProjectPicker(open.picker,anchor);")
+    # Gate 2026-10-08: focus is not handed back to a row whose sidebar is going out of sight.
+    closed = "open.dismiss({restoreFocus:false});"
+    assert hook.index(hidden) < hook.index(closed) < hook.index("_positionProjectPicker(open.picker,anchor);")
+    assert "if(opts&&opts.restoreFocus===false) return;" in show
+    assert show.index("document.removeEventListener('click',close);") < show.index(
+        "if(opts&&opts.restoreFocus===false) return;"
+    ) < show.index("_focusSessionActionMenuRestoreTarget(_projectPickerFocusReturnTarget(session,anchorEl));")
     # Greptile 2026-10-07: the cap a shorter window puts on the picker can cover the focused row.
     assert "if(focused&&open.picker.contains(focused)) _focusProjectPickerRow(open.picker,focused);" in hook
+
+
+def test_a_hidden_sidebar_is_a_collapsed_one_or_a_closed_drawer():
+    """Gate 2026-10-08: the resize hook closed the picker for a collapsed desktop sidebar only.
+    A large phone turned upright, or a window narrowed below 641px, leaves the sidebar a
+    drawer that is not open, with no `sidebar-collapsed` class to read; the picker floated."""
+    js = (Path(__file__).resolve().parent.parent / "static" / "sessions.js").read_text(encoding="utf-8")
+    hidden = _between(js, "function _projectPickerSidebarHidden(el){", "\n}\n")
+    lines = [line.strip() for line in hidden.splitlines() if line.strip()]
+    assert lines == [
+        "function _projectPickerSidebarHidden(el){",
+        "const sidebar=el.closest('.sidebar');",
+        # An open drawer is on screen at any width.
+        "if(!sidebar||sidebar.classList.contains('mobile-open')) return false;",
+        "if(sidebar.closest('.layout.sidebar-collapsed')) return true;",
+        # boot.js owns the 641px breakpoint; sessions.js loads before it.
+        "return typeof _isDesktopWidth==='function'&&!_isDesktopWidth();",
+    ]
+    boot = (Path(__file__).resolve().parent.parent / "static" / "boot.js").read_text(encoding="utf-8")
+    assert "function _isDesktopWidth(){" in boot
+    assert "window.matchMedia('(min-width:641px)').matches" in boot
+

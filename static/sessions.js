@@ -10089,9 +10089,11 @@ function _showProjectPicker(session, anchorEl){
   // Keyboard (#8044): arrows move between the rows, Escape closes the picker
   // and hands focus back to the conversation's ⋮ trigger.
   picker.setAttribute('aria-label',t('session_move_project'));
-  const dismiss=()=>{
+  const dismiss=(opts)=>{
     picker.remove();
     document.removeEventListener('click',close);
+    // Not to a row that is going out of sight with its sidebar.
+    if(opts&&opts.restoreFocus===false) return;
     _focusSessionActionMenuRestoreTarget(_projectPickerFocusReturnTarget(session,anchorEl));
   };
   _wireProjectPickerKeys(picker,dismiss);
@@ -10154,11 +10156,12 @@ window.addEventListener('resize',()=>{
         anchor=_projectPickerFocusReturnTarget({session_id:open.sessionId},null)||anchor;
       }
     }
-    // A turned phone closes the drawer and collapses the sidebar. The row is
-    // then still laid out, inside a sidebar of no width that turns invisible
-    // 200ms later, so the collapsed state is read from the classes that hide it.
-    if(!anchor||!anchor.offsetParent||anchor.closest('.layout.sidebar-collapsed .sidebar:not(.mobile-open)')){
-      open.dismiss();
+    // A resize can hide the sidebar the row is in. The row is then still laid
+    // out for a moment, inside a sidebar that fades or slides out of sight, so
+    // the hidden state is read from what hides it, and focus is not handed
+    // back to the row.
+    if(!anchor||!anchor.offsetParent||_projectPickerSidebarHidden(anchor)){
+      open.dismiss({restoreFocus:false});
       return;
     }
     _positionProjectPicker(open.picker,anchor);
@@ -10167,6 +10170,17 @@ window.addEventListener('resize',()=>{
     if(focused&&open.picker.contains(focused)) _focusProjectPickerRow(open.picker,focused);
   });
 });
+
+// Whether the sidebar that holds `el` is out of sight: collapsed at desktop
+// widths (a turned phone closes the drawer and collapses it), or a drawer that
+// is not open at phone widths (a large phone turned upright, a window narrowed
+// below boot.js's 641px).
+function _projectPickerSidebarHidden(el){
+  const sidebar=el.closest('.sidebar');
+  if(!sidebar||sidebar.classList.contains('mobile-open')) return false;
+  if(sidebar.closest('.layout.sidebar-collapsed')) return true;
+  return typeof _isDesktopWidth==='function'&&!_isDesktopWidth();
+}
 
 // ── Project picker rows and keyboard (#8044) ────────────────────────────
 // A picker row is a real button, so Tab reaches it and Enter/Space activate
