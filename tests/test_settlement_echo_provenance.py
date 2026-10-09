@@ -282,6 +282,50 @@ process.stdout.write(JSON.stringify(rows));
 
 
 @pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_settlement_nested_identity_distinguishes_and_dedups_rows():
+    """Greptile on #8116: the variant test above always carried a top-level row_id,
+    which wins, and used one row, so nested identity was never exercised. With NO
+    top-level id: two same-text rows with different nested ids both survive
+    (legitimate repeated prose), and two with the same nested id collapse to one
+    (a genuine echo)."""
+    for key in ("local_id", "row_id", "event_id"):
+        for second_id, expected in ((f"nested-{key}-b", 2), (f"nested-{key}-a", 1)):
+            rows_js = json.dumps([
+                {"role": "prose", "text": "Processing the request now",
+                 "identity": {key: f"nested-{key}-a"}, "source_event_type": "token",
+                 "kind": "process_prose", "status": "completed"},
+                {"role": "prose", "text": "Processing the request now",
+                 "identity": {key: second_id}, "source_event_type": "token",
+                 "kind": "process_prose", "status": "completed"},
+            ])
+            script = (
+                _SETTLEMENT_JS_BOOT
+                + """
+const messages = [
+  {role:'user', content:'Prompt', id:'user-1'},
+  {role:'assistant', content:'Final answer', id:'asst-1'},
+];
+const projectedScene = {
+  mode:'compact_worklog',
+  final_answer:'Final answer',
+  identity:{source_message_refs:['asst-1']},
+  lifecycle:{},
+  activity_rows:"""
+                + rows_js
+                + """
+};
+const scene = _completeSettledAnchorSceneForTurn(messages, 1, projectedScene);
+const rows = (scene && scene.activity_rows || []).map(r => ({role:r.role, text:r.text}));
+process.stdout.write(JSON.stringify(rows));
+"""
+            )
+            result = _run_node_script(script)
+            assert len(result) == expected, (
+                f"identity.{key}: second id {second_id!r} expected {expected} row(s), got {len(result)}: {result}"
+            )
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
 def test_settlement_same_id_latest_value_enrichment():
     """Same-ID projected row with different text keeps the LATEST value
     (enrichment, not stale-first)."""
