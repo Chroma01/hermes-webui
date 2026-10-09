@@ -62,7 +62,7 @@ export HERMES_WEBUI_PYTHON=/absolute/path/to/working/python
 ./start.sh
 ```
 
-For a source checkout that path is the agent venv python (`.../hermes-agent/venv/bin/python`). For a package-managed install leave `HERMES_WEBUI_PYTHON` unset whenever the launcher discovers the agent on its own — managed activation selects and leases the committed generation on every launch. Never persist a resolved generation path (`installs/<key>/environments/<hash>/venv/bin/python`): unselected generations are garbage-collected after updates and the saved path stops existing. If an override is unavoidable, use the store python (first element of `hermes --print-runtime-command`), which owns the generation ABI and is stable across updates — never the pre-PM in-tree venv — see [Hermes package-managed runtime bootstrap order](#hermes-package-managed-runtime-bootstrap-order).
+For a source checkout that path is the agent venv python (`.../hermes-agent/venv/bin/python`). For a package-managed install leave `HERMES_WEBUI_PYTHON` unset whenever the launcher discovers the agent on its own — provided the agent's interpreter switch is enabled (the default: `HERMES_DISABLE_LAZY_INSTALLS` unset, `updateMechanism=self`, checkout with `.git`/`pyproject.toml`). Managed activation then selects and leases the committed generation on every launch. Never persist a resolved generation path (`installs/<key>/environments/<hash>/venv/bin/python`): unselected generations are garbage-collected after updates and the saved path stops existing. If the service suppresses the interpreter switch (e.g. it sets `HERMES_DISABLE_LAZY_INSTALLS=1`), leaving the override unset re-selects the in-tree venv — `discover_launcher_python()` prefers it and the pre-flight's pure-Python check passes on it while every turn fails. In that case set `HERMES_WEBUI_PYTHON` to the store python instead: the first element of `hermes --print-runtime-command`, which owns the generation ABI and is stable across updates — never the pre-PM in-tree venv — see [Hermes package-managed runtime bootstrap order](#hermes-package-managed-runtime-bootstrap-order).
 
 ### Step 3 — install the agent in editable mode
 
@@ -100,7 +100,7 @@ from pydantic_core._pydantic_core import SchemaValidator        # compiled: fail
 print('ok')"
 ```
 
-(On agents without `hermes_bootstrap.py` the bare probe above is the whole check — server startup supports those legacy checkouts, so don't gate them on the compiled import.) The agent's launch preparation re-exec's a non-store interpreter into the store python before activation, so run this probe the way the service runs: with the service's `HERMES_HOME`, and with `HERMES_DISABLE_LAZY_INSTALLS=1` only if the service itself sets it. That variable (plus a non-`self` update mechanism, a checkout without `.git`/`pyproject.toml`, or a failed launch preparation) suppresses the re-exec — under those conditions the probe tests the launcher's interpreter directly, which is exactly the mismatch detector. If the bare probe printed `ok` but this one fails with `No module named 'pydantic_core._pydantic_core'`, the interpreter is on the wrong side of an ABI mismatch: fix the launcher's interpreter (`HERMES_WEBUI_PYTHON` unset, or the store python from `hermes --print-runtime-command`). Reinstalling or repairing `pydantic` changes nothing, because both environments are complete in isolation.
+(On agents without `hermes_bootstrap.py` the bare probe above is the whole check — server startup supports those legacy checkouts, so don't gate them on the compiled import.) The agent's launch preparation re-exec's a non-store interpreter into the store python before activation, so run this probe the way the service runs: with the service's `HERMES_HOME`, and with `HERMES_DISABLE_LAZY_INSTALLS=1` only if the service itself sets it. That variable (plus a non-`self` update mechanism, a checkout without `.git`/`pyproject.toml`, or a failed launch preparation) suppresses the re-exec — under those conditions the probe tests the launcher's interpreter directly, which is exactly the mismatch detector. If the bare probe printed `ok` but this one fails with `No module named 'pydantic_core._pydantic_core'`, the interpreter is on the wrong side of an ABI mismatch: fix the launcher's interpreter — `HERMES_WEBUI_PYTHON` unset when the interpreter switch is enabled, otherwise the store python from `hermes --print-runtime-command` (see step 2). Reinstalling or repairing `pydantic` changes nothing, because both environments are complete in isolation.
 
 If this fails, `import run_agent` itself is broken — check that the agent's pyproject.toml lists `run_agent` as a top-level module or that the agent dir is on PYTHONPATH:
 
@@ -165,7 +165,9 @@ them. This is also the false-negative in step 4's probe above: the bare probe's
 the server cannot run on.
 
 For a package-managed install the fix is to stop pinning an interpreter, not to
-pin a better one. Leave `HERMES_WEBUI_PYTHON` unset whenever the launcher
+pin a better one — provided the agent's interpreter switch is enabled (the
+default: `HERMES_DISABLE_LAZY_INSTALLS` unset, `updateMechanism=self`, checkout
+with `.git`/`pyproject.toml`). Leave `HERMES_WEBUI_PYTHON` unset whenever the launcher
 discovers the agent on its own: the agent's launch preparation re-exec's a
 non-store interpreter into the store python (`~/.hermes/tools/python-*`) before
 activation, and activation then selects and leases the committed generation —
@@ -173,7 +175,9 @@ the generation python itself is re-exec'd into the store python, so a saved
 generation path is neither the interpreter the Agent runs on nor stable across
 updates. Saved generation paths (`installs/<key>/environments/<hash>/venv/bin/python`)
 are garbage-collected once unselected, and the next `start.sh` exits before
-bootstrap can recover. If an override is unavoidable, use the first element of
+bootstrap can recover. If an override is unavoidable — or the service suppresses
+the interpreter switch (e.g. it sets `HERMES_DISABLE_LAZY_INSTALLS=1`, in which
+case an unset override falls back to the in-tree venv) — use the first element of
 `hermes --print-runtime-command`, which resolves the store python on every launch
 instead of persisting a versioned path. Run it with the service's `HERMES_HOME`
 when the install uses a non-default home (per-user installs live at
