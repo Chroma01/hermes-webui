@@ -35,7 +35,7 @@ management requests, not every scheduled execution.
 1. **Agent installed but not on `sys.path`.** Most common. The agent is checked out somewhere (e.g. `~/Programmes/hermes-agent`), the WebUI was launched with a Python that doesn't know about it, and there's no `pip install -e .` linking the two.
 2. **Symlink with a typo or wrong target.** A symlink to the agent looks correct on `ls`, but `readlink` resolves to a path that doesn't exist or doesn't contain `agent/__init__.py`.
 3. **`HERMES_WEBUI_AGENT_DIR` set to the wrong directory.** Override env var beats auto-discovery and points at a directory that has no agent code.
-4. **Agent installed as root, under the FHS layout.** When the Hermes Agent installer runs as root on Linux it places the agent at `/usr/local/lib/hermes-agent` (CLI linked into `/usr/local/bin`), not `~/.hermes/hermes-agent`. Older `bootstrap.py` didn't probe that path, so it built a WebUI-only `.venv` and failed at launch with **"Python environment cannot import both WebUI dependencies and Hermes Agent."** `git pull` to update the WebUI (current `bootstrap.py` auto-discovers the FHS layout and follows the `hermes` launcher to the agent), or set `HERMES_WEBUI_PYTHON` to the interpreter the `hermes` CLI itself runs on and relaunch. On a package-managed install do **not** use `/usr/local/lib/hermes-agent/venv/bin/python`: that in-tree venv is the pre-PM environment, built for a different interpreter than the committed dependency generation — see [Hermes package-managed runtime bootstrap order](#hermes-package-managed-runtime-bootstrap-order).
+4. **Agent installed as root, under the FHS layout.** When the Hermes Agent installer runs as root on Linux it places the agent at `/usr/local/lib/hermes-agent` (CLI linked into `/usr/local/bin`), not `~/.hermes/hermes-agent`. Older `bootstrap.py` didn't probe that path, so it built a WebUI-only `.venv` and failed at launch with **"Python environment cannot import both WebUI dependencies and Hermes Agent."** `git pull` to update the WebUI (current `bootstrap.py` auto-discovers the FHS layout and follows the `hermes` launcher to the agent), or leave `HERMES_WEBUI_PYTHON` unset and relaunch so every start follows the `hermes` launcher to the current generation. On a package-managed install do **not** use `/usr/local/lib/hermes-agent/venv/bin/python`: that in-tree venv is the pre-PM environment, built for a different interpreter than the committed dependency generation — and do not persist any resolved generation path either — see [Hermes package-managed runtime bootstrap order](#hermes-package-managed-runtime-bootstrap-order).
 
 ### Step 1 — confirm the agent location
 
@@ -54,7 +54,7 @@ The third command must succeed (the file must exist). If it fails, your symlink 
 cd ~/hermes-webui && ./start.sh 2>&1 | grep -iE 'agent|python|hermes_webui_python' | head -20
 ```
 
-The startup banner prints which Python and agent dir it resolved. If the agent dir is empty or the Python is the wrong one, set the override:
+The startup log shows how the launch resolved. If the agent dir is empty or the Python is the wrong one, set the override:
 
 ```bash
 export HERMES_WEBUI_AGENT_DIR=/absolute/path/to/hermes-agent
@@ -62,7 +62,7 @@ export HERMES_WEBUI_PYTHON=/absolute/path/to/working/python
 ./start.sh
 ```
 
-For a source checkout that path is the agent venv python (`.../hermes-agent/venv/bin/python`); for a package-managed install it is the committed generation's venv python from the resolver one-liner — not the pre-PM in-tree venv — see [Hermes package-managed runtime bootstrap order](#hermes-package-managed-runtime-bootstrap-order).
+For a source checkout that path is the agent venv python (`.../hermes-agent/venv/bin/python`). For a package-managed install leave `HERMES_WEBUI_PYTHON` unset whenever the launcher discovers the agent on its own — managed activation selects and leases the committed generation on every launch. Never persist a resolved generation path (`installs/<key>/environments/<hash>/venv/bin/python`): unselected generations are garbage-collected after updates and the saved path stops existing. If an override is unavoidable, use the store python (first element of `hermes --print-runtime-command`), which owns the generation ABI and is stable across updates — never the pre-PM in-tree venv — see [Hermes package-managed runtime bootstrap order](#hermes-package-managed-runtime-bootstrap-order).
 
 ### Step 3 — install the agent in editable mode
 
@@ -88,17 +88,19 @@ If steps 1-3 still don't work, check whether the WebUI's Python can import the a
 $HERMES_WEBUI_PYTHON -c "from run_agent import AIAgent; print('ok')" 2>&1
 ```
 
-(Replace `$HERMES_WEBUI_PYTHON` with the actual Python path from step 2 if the env var isn't set.) If this prints `ok`, the agent IS on `sys.path` for that Python. It does **not** mean the WebUI will serve a turn: this probe never activates the managed dependency layer that the server activates at startup, so it cannot see a wrong-interpreter (ABI) mismatch — see [Hermes package-managed runtime bootstrap order](#hermes-package-managed-runtime-bootstrap-order). To check the interpreter the server will actually use, activate that layer first and then import a compiled extension:
+(Replace `$HERMES_WEBUI_PYTHON` with the actual Python path from step 2 if the env var isn't set.) If this prints `ok`, the agent IS on `sys.path` for that Python. It does **not** prove the WebUI will serve a turn: a bare `run_agent` import pulls in no compiled extensions, so this probe passes on an interpreter the server cannot run on — see [Hermes package-managed runtime bootstrap order](#hermes-package-managed-runtime-bootstrap-order). On installs whose agent ships `hermes_bootstrap.py`, check the activated layer too by importing a compiled extension after the bootstrap import:
 
 ```bash
-HERMES_DISABLE_LAZY_INSTALLS=1 PYTHONPATH=/path/to/hermes-agent $HERMES_WEBUI_PYTHON -c "
+PYTHONPATH=/path/to/hermes-agent $HERMES_WEBUI_PYTHON -c "
+import sys
 import hermes_bootstrap                                        # activates the committed dependency environment
+print(sys.executable)
 from run_agent import AIAgent
 from pydantic_core._pydantic_core import SchemaValidator        # compiled: fails on an ABI mismatch
 print('ok')"
 ```
 
-`HERMES_DISABLE_LAZY_INSTALLS=1` keeps the agent's launch preparation from re-exec'ing this snippet into the store interpreter. Run this probe with the service's `HERMES_HOME` (and `HERMES_BASE_HOME`, when the service sets it) — otherwise it can resolve a different home's committed generation and report an unrelated pass or failure. If the bare probe printed `ok` but this one fails with `No module named 'pydantic_core._pydantic_core'`, the interpreter is on the wrong side of an ABI mismatch: fix the launcher's interpreter. Reinstalling or repairing `pydantic` changes nothing, because both environments are complete in isolation.
+(On agents without `hermes_bootstrap.py` the bare probe above is the whole check — server startup supports those legacy checkouts, so don't gate them on the compiled import.) The agent's launch preparation re-exec's a non-store interpreter into the store python before activation, so run this probe the way the service runs: with the service's `HERMES_HOME`, and with `HERMES_DISABLE_LAZY_INSTALLS=1` only if the service itself sets it. That variable (plus a non-`self` update mechanism, a checkout without `.git`/`pyproject.toml`, or a failed launch preparation) suppresses the re-exec — under those conditions the probe tests the launcher's interpreter directly, which is exactly the mismatch detector. If the bare probe printed `ok` but this one fails with `No module named 'pydantic_core._pydantic_core'`, the interpreter is on the wrong side of an ABI mismatch: fix the launcher's interpreter (`HERMES_WEBUI_PYTHON` unset, or the store python from `hermes --print-runtime-command`). Reinstalling or repairing `pydantic` changes nothing, because both environments are complete in isolation.
 
 If this fails, `import run_agent` itself is broken — check that the agent's pyproject.toml lists `run_agent` as a top-level module or that the agent dir is on PYTHONPATH:
 
@@ -115,7 +117,7 @@ If after running steps 1-4 the import still fails *and* `pip install -e .` succe
 - The output of every command in steps 1-4
 - The full diagnostic block printed by the WebUI's `ImportError` (v0.51.6+)
 - Your OS, Python version, and how the agent was installed
-- The interpreter your launcher resolved (the startup banner's `python` line, or `readlink /proc/<pid>/exe` for a systemd unit)
+- The interpreter your launcher resolved (or `readlink /proc/<pid>/exe` for a systemd unit)
 
 ---
 
@@ -142,45 +144,48 @@ interpreter. This ordering repair does not remove the static fallback lock or
 change cross-profile credential handling.
 
 The launcher must still hand `bootstrap.py` an interpreter on the same side of the
-Python ABI as the committed dependency generation. WebUI does not choose the
+Python ABI as the committed dependency generation — for example, the pre-PM
+in-tree `venv` (3.11) beside a 3.14 generation. WebUI does not choose the
 generation, but the interpreter it starts with decides whether that generation can
 load: `activate_dependencies()` replaces `sys.path` with the generation's
-`site-packages`, so a process built for another minor version — classically the
-pre-PM in-tree `venv` (3.11) beside a 3.14 generation — starts, serves `/health`,
+`site-packages`, so a process built for another minor version starts, serves `/health`,
 and then fails on **every** turn, with every MCP server reporting a connect failure
 in the same breath:
 
 ```
 Failed to initialize OpenAI client: No module named 'pydantic_core._pydantic_core'
-tools.mcp_tool has no attribute 'StdioServerParameters'
+module 'tools.mcp_tool' has no attribute 'StdioServerParameters'
 MCP server '<name>' requires HTTP transport but mcp.client.streamable_http is not available
 ```
 
 Those are the same ABI failure re-wrapped several modules deep, not a broken `mcp`
 package and not broken MCP servers — do not upgrade or disable MCP servers over
-them. This is also the false-negative in step 4's probe above: the compatibility
-probe imports `run_agent` before activation, so it passes on an interpreter the
-server cannot run on.
+them. This is also the false-negative in step 4's probe above: the bare probe's
+`run_agent` import pulls in no compiled extensions, so it passes on an interpreter
+the server cannot run on.
 
-Resolve the interpreter the Agent itself runs on instead of hardcoding a versioned
-path (both `tools/python-*` and `installs/<key>/environments/<hash>` change on
-update). Run this with the service's `HERMES_HOME` if the install uses a
-non-default home:
+For a package-managed install the fix is to stop pinning an interpreter, not to
+pin a better one. Leave `HERMES_WEBUI_PYTHON` unset whenever the launcher
+discovers the agent on its own: the agent's launch preparation re-exec's a
+non-store interpreter into the store python (`~/.hermes/tools/python-*`) before
+activation, and activation then selects and leases the committed generation —
+the generation python itself is re-exec'd into the store python, so a saved
+generation path is neither the interpreter the Agent runs on nor stable across
+updates. Saved generation paths (`installs/<key>/environments/<hash>/venv/bin/python`)
+are garbage-collected once unselected, and the next `start.sh` exits before
+bootstrap can recover. If an override is unavoidable, use the first element of
+`hermes --print-runtime-command`, which resolves the store python on every launch
+instead of persisting a versioned path. Run it with the service's `HERMES_HOME`
+when the install uses a non-default home (per-user installs live at
+`~/.hermes/hermes-agent`; the FHS path above is the root-on-Linux layout only).
 
-```bash
-AGENT_DIR=/usr/local/lib/hermes-agent
-python3 -c "import sys; sys.path.insert(0, '$AGENT_DIR'); \
-  from pathlib import Path; from pm.environments import project_python; \
-  print(project_python(Path('$AGENT_DIR')))"
-# -> the committed generation's venv python; use it for HERMES_WEBUI_PYTHON
-```
-
-The bare store python (`~/.hermes/tools/python-*`) is *also* wrong here:
-`bootstrap.py`'s pre-flight `_python_can_run_webui_and_agent()` probe runs before
-activation, fails there, and silently falls back to the in-tree venv. From the
-outside, `/health` and `/api/health/agent` both return `200` while this is broken;
-only a real turn (`POST /api/chat`, or `POST /api/chat/start` + `GET /api/chat/stream`)
-constructs the OpenAI client
+The bare store python needs no workaround either: run through `bootstrap.py`'s
+pre-flight `_python_can_run_webui_and_agent()` probe it behaves like any managed
+interpreter, because that probe itself triggers the same launch preparation and
+activation. From the outside, `/health` and `/api/health/agent` both return `200`
+while this is broken; only a real turn (`POST /api/chat`, or
+`POST /api/chat/start` + `GET /api/chat/stream`) constructs the OpenAI client
+and surfaces the mismatch.
 
 The native Windows launcher also decides *which* Agent root that bootstrap runs
 from, so the two have to agree. `start.ps1` normally keeps the source-first
