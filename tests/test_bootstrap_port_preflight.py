@@ -402,6 +402,21 @@ def test_port_conflict_raises_the_dedicated_error(
         bootstrap._check_port_available("127.0.0.1", 9099)
 
 
+def _stdlib_ssl_context_class() -> type:
+    """The stdlib ``ssl.SSLContext``, even after ``truststore.inject_into_ssl()``.
+
+    Hermes Agent's ``agent/ssl_verify.py`` injects truststore process-wide, and an
+    earlier test in the same pytest process can import it. truststore's
+    ``SSLContext.wrap_socket`` then verifies the peer chain even on this
+    server-side listening socket and raises. Walk back to the stdlib class
+    rather than patching global SSL state.
+    """
+    cls = ssl.SSLContext
+    while cls.__module__ != "ssl" and cls.__bases__:
+        cls = cls.__bases__[0]
+    return cls
+
+
 @contextlib.contextmanager
 def _serve(
     body: bytes, status: int = 200, cert: str | None = None, key: str | None = None
@@ -424,7 +439,7 @@ def _serve(
 
     with http.server.HTTPServer(("127.0.0.1", 0), _Handler) as httpd:
         if cert and key:
-            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ctx = _stdlib_ssl_context_class()(ssl.PROTOCOL_TLS_SERVER)
             ctx.load_cert_chain(cert, key)
             httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
         port = httpd.server_address[1]
