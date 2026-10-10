@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from api.compression_anchor import visible_messages_for_anchor
 from api.models import Session
 from api.streaming import (
@@ -1331,6 +1333,56 @@ def test_tool_rows_with_distinct_durable_rows_still_backfill():
     )
 
     assert [m["content"] for m in merged if m.get("role") == "tool"] == ["first output", "other output"]
+
+
+def _summary_backfill_case(display_ids, context_ids):
+    """Display shows the full tool output; context carries the agent's one-line
+    summary of the same tool call. Returns the merged tool-row contents."""
+    full_output = "full search output " + ("x" * 200)
+    summary = "[search_files] content search -> 3 matches"
+    previous_display = [
+        {"role": "user", "content": "find it"},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "call_s"}]},
+        {"role": "tool", "tool_call_id": "call_s", "content": full_output, **display_ids},
+        {"role": "assistant", "content": "found"},
+    ]
+    previous_context = [
+        {"role": "user", "content": "find it"},
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "call_s"}]},
+        {"role": "tool", "tool_call_id": "call_s", "content": summary, **context_ids},
+        {"role": "assistant", "content": "found"},
+    ]
+    result_messages = previous_context + [
+        {"role": "user", "content": "next"},
+        {"role": "assistant", "content": "ok"},
+    ]
+    merged = _merge_display_messages_after_agent_result(
+        previous_display, previous_context, result_messages, "next",
+    )
+    return [m["content"] for m in merged if m.get("role") == "tool"], full_output, summary
+
+
+def test_state_db_row_id_alias_is_the_same_durable_row():
+    """Greptile on release #8140: rows loaded from state.db carry
+    ``_state_db_row_id``, not ``_row_id``. The same durable row under either
+    alias must still suppress the summary backfill."""
+    rows, full_output, _summary = _summary_backfill_case({"_state_db_row_id": 190285}, {"_row_id": 190285})
+    assert rows == [full_output]
+    rows, full_output, _summary = _summary_backfill_case({"_state_db_row_id": "190285"}, {"_state_db_row_id": 190285})
+    assert rows == [full_output]
+
+
+@pytest.mark.parametrize(
+    "bad_ids",
+    [{}, {"_row_id": True}, {"_row_id": "abc"}, {"_row_id": 0}, {"_row_id": -4},
+     {"_row_id": 7, "_state_db_row_id": 8}],
+    ids=["missing", "bool", "string", "zero", "negative", "contradictory"],
+)
+def test_invalid_durable_identity_keeps_content_based_backfill(bad_ids):
+    """Without a valid durable identity the merge keeps today's content-based
+    behaviour: the differing summary is not proven to be the displayed row."""
+    rows, full_output, summary = _summary_backfill_case(bad_ids, bad_ids)
+    assert rows == [full_output, summary]
 
 
 def _durable_tool_display_and_context(context_tool_content):

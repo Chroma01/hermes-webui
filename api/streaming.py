@@ -8079,7 +8079,7 @@ def _message_identity(msg):
 
 
 def _durable_tool_row_identity(msg):
-    """Return (tool_call_id, _row_id) for a tool row with a valid durable row.
+    """Return (tool_call_id, row_id) for a tool row with a valid durable row.
 
     Agent-side compression rewrites old tool results in model context to a
     one-line summary while keeping the state.db row, so content-based identity
@@ -8088,10 +8088,15 @@ def _durable_tool_row_identity(msg):
     """
     if not isinstance(msg, dict) or msg.get('role') != 'tool':
         return None
-    row_id = msg.get('_row_id')
-    tool_call_id = msg.get('tool_call_id')
-    if isinstance(row_id, bool) or not isinstance(row_id, int) or row_id <= 0:
+    # Read the row through the canonical provenance helper: messages loaded
+    # from state.db (and IDs preserved from older Agents) carry
+    # ``_state_db_row_id`` rather than ``_row_id``, and both sides of the
+    # backfill must normalize to the same identity. Contradictory aliases are
+    # invalid and fall back to content-based matching.
+    row_id, valid = _state_db_row_identity_details(msg)
+    if not valid or row_id is None or int(row_id) <= 0:
         return None
+    tool_call_id = msg.get('tool_call_id')
     if not isinstance(tool_call_id, str) or not tool_call_id:
         return None
     return (tool_call_id, row_id)
