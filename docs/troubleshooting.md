@@ -65,11 +65,17 @@ export HERMES_WEBUI_PYTHON=/absolute/path/to/working/python
 For a source checkout that path is the agent venv python (`.../hermes-agent/venv/bin/python`). For a package-managed install with relaunch enabled (the default: `HERMES_DISABLE_LAZY_INSTALLS` unset, `updateMechanism=self`, checkout with `.git`/`pyproject.toml`), leave `HERMES_WEBUI_PYTHON` unset whenever the launcher discovers the agent on its own — managed activation selects and leases the committed generation on every launch. Never persist a resolved path — neither a generation path (`installs/<key>/environments/<hash>/venv/bin/python`, garbage-collected once unselected) nor a store path (`tools/python-*`, superseded on managed-python updates): both stop being the interpreter the Agent runs on. If the service suppresses relaunch (e.g. it sets `HERMES_DISABLE_LAZY_INSTALLS=1`), leaving the override unset re-selects a non-managed python — `discover_launcher_python()` prefers `agent_dir/venv/bin/python` when it exists (else the WebUI `.venv`, else system `python3`) and the pre-flight's pure-Python check passes on it while every turn fails. Those services must resolve the store python fresh at every start instead: `hermes --print-runtime-command` prints a JSON array whose element zero is the store python, so decode it in the service's own launch step (a systemd `ExecStart` wrapper or `EnvironmentFile` generator) and export it as `HERMES_WEBUI_PYTHON` (Python 3 is already required, so its standard library does the decoding):
 
 ```bash
-export HERMES_WEBUI_PYTHON="$(hermes --print-runtime-command \
-  | python3 -c 'import json, sys; print(json.load(sys.stdin)[0])')"
+HERMES_WEBUI_PYTHON="$(hermes --print-runtime-command \
+  | python3 -c 'import json, sys; print(json.load(sys.stdin)[0])')" || exit 1
+[ -x "$HERMES_WEBUI_PYTHON" ] || exit 1
+export HERMES_WEBUI_PYTHON
 ```
 
-A wrong extraction (e.g. `cut -d, -f1`) yields a truncated path that fails loudly when the launcher execs it — never a saved path, never the pre-PM in-tree venv — see [Hermes package-managed runtime bootstrap order](#hermes-package-managed-runtime-bootstrap-order).
+Assign, check, then export: `export VAR="$(…)"` succeeds even when the command
+substitution fails, so a launcher that can't find `hermes` would otherwise start
+with an empty `HERMES_WEBUI_PYTHON` instead of stopping.
+
+A wrong extraction (e.g. `cut -d, -f1`) yields a JSON-quoted fragment instead of a path that fails loudly when the launcher execs it — never a saved path, never the pre-PM in-tree venv — see [Hermes package-managed runtime bootstrap order](#hermes-package-managed-runtime-bootstrap-order).
 
 ### Step 3 — install the agent in editable mode
 
@@ -193,9 +199,15 @@ array whose element zero is the store python; decode it in the service's own
 launch step (a systemd `ExecStart` wrapper or `EnvironmentFile` generator):
 
 ```bash
-export HERMES_WEBUI_PYTHON="$(hermes --print-runtime-command \
-  | python3 -c 'import json, sys; print(json.load(sys.stdin)[0])')"
+HERMES_WEBUI_PYTHON="$(hermes --print-runtime-command \
+  | python3 -c 'import json, sys; print(json.load(sys.stdin)[0])')" || exit 1
+[ -x "$HERMES_WEBUI_PYTHON" ] || exit 1
+export HERMES_WEBUI_PYTHON
 ```
+
+Assign, check, then export: `export VAR="$(…)"` succeeds even when the command
+substitution fails, so a launcher that can't find `hermes` would otherwise start
+with an empty `HERMES_WEBUI_PYTHON` instead of stopping.
 
 That resolves per-launch instead of persisting a versioned path. Run it with
 the service's `HERMES_HOME` when the install uses a non-default home (per-user
