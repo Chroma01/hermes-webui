@@ -2373,7 +2373,7 @@ def test_run_git_still_authenticates_with_a_cached_credential(
     tmp_path, monkeypatch
 ):
     """Disabling interaction must keep cached credentials working (#8048)."""
-    _helper, cache, prompted, invoked = _disposable_git_home(tmp_path, monkeypatch)
+    _helper, cache, _prompted, invoked = _disposable_git_home(tmp_path, monkeypatch)
     cache.write_text('username=user\npassword=secret\n', encoding='utf-8')
     requests_seen = []
     server = _auth_static_server(tmp_path, requests_seen)
@@ -2387,4 +2387,8 @@ def test_run_git_still_authenticates_with_a_cached_credential(
     assert ok is True, out
     assert len(requests_seen) >= 2, f'no credential round trip: {requests_seen}'
     assert invoked.exists(), 'the configured helper never ran, so this proves nothing'
-    assert not prompted.exists(), f'a credential prompt was launched: {out!r}'
+    # No "no prompt" assertion here on purpose. The fixture answers from its cache
+    # first - that ordering is what makes it a faithful GCM stand-in - so on this
+    # path the prompt branch is unreachable and such an assertion could never fail:
+    # structure, not evidence. The prompt path is asserted where it can fail, in
+    # test_run_git_uses_a_configured_gui_credential_helper_without_prompting.
