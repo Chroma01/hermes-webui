@@ -46,7 +46,7 @@ def _prompt(session_id, *, profile="default", workspace="/home/me/project", conf
 
 
 def _shared_prefix(first: str, second: str) -> int:
-    for index, (left, right) in enumerate(zip(first, second)):
+    for index, (left, right) in enumerate(zip(first, second, strict=False)):
         if left != right:
             return index
     return min(len(first), len(second))
