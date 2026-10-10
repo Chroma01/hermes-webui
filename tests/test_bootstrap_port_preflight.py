@@ -242,6 +242,39 @@ def test_already_serving_scheme_probes_the_configured_address(
     assert seen == [(probe_url, 1.0)]
 
 
+@pytest.mark.parametrize("host", ["::", "[::]"])
+def test_already_serving_scheme_wildcard_ipv6_also_finds_an_ipv4_own_instance(
+    monkeypatch: pytest.MonkeyPatch, host: str
+) -> None:
+    """Senior gate on #8112: on dual-stack Linux, binding ``::`` conflicts with
+    an own WebUI on 127.0.0.1:8787 that [::1] never reaches. Probing only [::1]
+    reported a foreign conflict and advised a second instance on the same state
+    dir; the IPv4 loopback probe finds the running WebUI instead."""
+    seen: list = []
+
+    def fake_wait(url: str, timeout: float = 0.0, **kwargs: object) -> str:
+        seen.append(url)
+        return "http" if url.startswith("http://127.0.0.1:") else ""
+
+    monkeypatch.setattr(bootstrap, "wait_for_health", fake_wait)
+    assert bootstrap._already_serving_scheme(host, 8787) == "http"
+    assert seen == ["http://[::1]:8787/health", "http://127.0.0.1:8787/health"]
+
+
+def test_already_serving_scheme_ipv4_host_does_not_probe_ipv6(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list = []
+
+    def fake_wait(url: str, timeout: float = 0.0, **kwargs: object) -> str:
+        seen.append(url)
+        return ""
+
+    monkeypatch.setattr(bootstrap, "wait_for_health", fake_wait)
+    assert bootstrap._already_serving_scheme("0.0.0.0", 8787) == ""
+    assert seen == ["http://127.0.0.1:8787/health"]
+
+
 def test_probe_host_keeps_the_configured_address() -> None:
     """``_probe_host`` must not collapse into ``_url_host``.
 

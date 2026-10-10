@@ -823,14 +823,23 @@ def _already_serving_scheme(host: str, port: int) -> str:
     the running instance may serve HTTPS with settings from another launcher
     or an earlier shell, which this process cannot see in its own env.
     """
-    probe_host = _probe_host(host)
-    return wait_for_health(
-        f"http://{probe_host}:{port}/health",
-        timeout=1.0,
-        markers=_HERMES_HEALTH_MARKERS,
-        accept_degraded=True,
-        tls_unknown=True,
-    )
+    probe_hosts = [_probe_host(host)]
+    # On a dual-stack host, binding ``::`` also conflicts with an IPv4-only
+    # listener on 127.0.0.1. That listener may be our own WebUI, which [::1]
+    # never reaches, so probe IPv4 loopback too before calling it foreign.
+    if host in ("::", "[::]"):
+        probe_hosts.append("127.0.0.1")
+    for probe_host in probe_hosts:
+        scheme = wait_for_health(
+            f"http://{probe_host}:{port}/health",
+            timeout=1.0,
+            markers=_HERMES_HEALTH_MARKERS,
+            accept_degraded=True,
+            tls_unknown=True,
+        )
+        if scheme:
+            return scheme
+    return ""
 
 
 def main() -> int:
