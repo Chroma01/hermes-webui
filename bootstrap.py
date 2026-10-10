@@ -659,7 +659,10 @@ def _apply_bind_flags(sock: socket.socket) -> None:
     for the binding socket; the check must not be laxer than the bind it
     predicts.
     """
-    if sys.platform == "win32":
+    # server.py keys its own bind on sys.platform == "win32"; resolved per
+    # call, so a test can simulate either platform.
+    windows = sys.platform == "win32"
+    if windows:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)
         sock.setsockopt(
             socket.SOL_SOCKET, getattr(socket, "SO_EXCLUSIVEADDRUSE", -5), 1
