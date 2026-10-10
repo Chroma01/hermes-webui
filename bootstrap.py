@@ -764,12 +764,15 @@ def _url_host(host: str) -> str:
 
     Wildcard binds ("", "0.0.0.0", "::", "[::]") mean "every interface",
     which is not a reachable URL host, so they map to localhost - the address
-    a wildcard-bound server answers on. IPv6 literals need brackets:
-    ``http://::1:8787`` parses the last address group as the port, so the
-    health probe, the printed URL and the browser open all miss the running
-    server (review #8112).
+    a wildcard-bound server answers on. Loopback keeps that name too: the
+    browser origin - and with it the passkey rpId and the saved session in
+    localStorage - is bound to the hostname the UI was opened on, so an
+    explicit ``--host 127.0.0.1`` must not move it to the numeric address.
+    IPv6 literals need brackets: ``http://::1:8787`` parses the last address
+    group as the port, so the health probe, the printed URL and the browser
+    open all miss the running server (review #8112).
     """
-    if host in ("", "0.0.0.0", "::", "[::]"):
+    if host in ("", "0.0.0.0", "::", "[::]", "127.0.0.1", "localhost"):
         return "localhost"
     if ":" in host and not host.startswith("["):
         return f"[{host}]"

@@ -255,8 +255,7 @@ def test_occupied_port_with_healthy_webui_opens_browser(
     monkeypatch.setattr(bootstrap, "open_browser", opened.append)
 
     assert bootstrap.main() == 0
-    # --host 127.0.0.1 is a reachable URL host, so it is kept verbatim.
-    assert opened == [f"http://127.0.0.1:{bootstrap.DEFAULT_PORT}"]
+    assert opened == ["http://localhost:" + str(bootstrap.DEFAULT_PORT)]
 
 
 def test_occupied_port_by_foreign_listener_still_errors(
@@ -286,7 +285,7 @@ def test_occupied_port_in_foreground_reports_our_own_instance(
         bootstrap.main()
     message = str(excinfo.value)
     assert (
-        f"Hermes WebUI is already running at http://127.0.0.1:{bootstrap.DEFAULT_PORT}"
+        f"Hermes WebUI is already running at http://localhost:{bootstrap.DEFAULT_PORT}"
         in message
     )
     assert "Stop that instance first" in message
@@ -430,13 +429,20 @@ def test_degraded_answer_is_not_ready_for_the_health_wait() -> None:
 
 
 def test_url_host_maps_wildcards_and_brackets_ipv6() -> None:
+    """Loopback stays localhost, so the browser origin cannot move.
+
+    Passkeys are bound to the hostname (WebAuthn rpId) and the session
+    lives in that origin's localStorage, so --host 127.0.0.1 must keep
+    opening localhost.
+    """
     assert bootstrap._url_host("") == "localhost"
     assert bootstrap._url_host("0.0.0.0") == "localhost"
     assert bootstrap._url_host("::") == "localhost"
     assert bootstrap._url_host("[::]") == "localhost"
+    assert bootstrap._url_host("127.0.0.1") == "localhost"
+    assert bootstrap._url_host("localhost") == "localhost"
     assert bootstrap._url_host("::1") == "[::1]"
     assert bootstrap._url_host("[::1]") == "[::1]"
-    assert bootstrap._url_host("127.0.0.1") == "127.0.0.1"
     assert bootstrap._url_host("192.168.1.5") == "192.168.1.5"
 
 
@@ -458,7 +464,7 @@ def test_already_serving_scheme_brackets_ipv6_probe_host(
 
 @pytest.mark.parametrize(
     "host, url_host",
-    [("::1", "[::1]"), ("0.0.0.0", "localhost")],
+    [("::1", "[::1]"), ("0.0.0.0", "localhost"), ("127.0.0.1", "localhost")],
 )
 def test_occupied_port_url_uses_a_reachable_host(
     monkeypatch: pytest.MonkeyPatch, host: str, url_host: str
