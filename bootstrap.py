@@ -779,6 +779,30 @@ def _url_host(host: str) -> str:
     return host
 
 
+def _probe_host(host: str) -> str:
+    """The configured address, as a health-check URL must spell it.
+
+    Deliberately NOT ``_url_host``: that one keeps the browser on ``localhost``
+    so the saved session and the passkey rpId keep their origin. Health checks
+    must instead stay on the address the user configured. With ``HTTP_PROXY``
+    set and ``NO_PROXY=127.0.0.1``, a probe to ``localhost`` is sent through the
+    proxy while ``127.0.0.1`` bypasses it, so a proxy that refuses local requests
+    makes bootstrap report a failure - or an existing WebUI as a port conflict -
+    for a server that is running (review #8112).
+
+    Wildcard binds have no reachable URL host of their own: they are probed on
+    loopback of the same family (``""``/``0.0.0.0`` on 127.0.0.1, ``::`` on
+    [::1]). IPv6 literals need brackets, or the last group parses as the port.
+    """
+    if host in ("", "0.0.0.0"):
+        return "127.0.0.1"
+    if host in ("::", "[::]"):
+        return "[::1]"
+    if ":" in host and not host.startswith("["):
+        return f"[{host}]"
+    return host
+
+
 def _already_serving_scheme(host: str, port: int) -> str:
     """Scheme of a healthy Hermes WebUI already answering on host:port, else "".
 
@@ -787,7 +811,8 @@ def _already_serving_scheme(host: str, port: int) -> str:
     healthy WebUI: re-running bootstrap, or ``start.sh`` falling through to
     bootstrap when neither curl nor wget is installed. Advising a second
     instance on the same state dir in that case is wrong. Wildcard binds are
-    probed on localhost, where a server bound to 0.0.0.0 answers.
+    probed on loopback of their own family, where a server bound to 0.0.0.0
+    (or ::) answers.
 
     Only the WebUI's own payload counts (``_HERMES_HEALTH_MARKERS``): any
     other service that happens to answer a generic ``{"status": "ok"}`` on
@@ -798,7 +823,7 @@ def _already_serving_scheme(host: str, port: int) -> str:
     the running instance may serve HTTPS with settings from another launcher
     or an earlier shell, which this process cannot see in its own env.
     """
-    probe_host = _url_host(host)
+    probe_host = _probe_host(host)
     return wait_for_health(
         f"http://{probe_host}:{port}/health",
         timeout=1.0,
@@ -955,7 +980,7 @@ def main() -> int:
             start_new_session=True,
         )
 
-    health_url = f"{scheme}://{_url_host(args.host)}:{args.port}/health"
+    health_url = f"{scheme}://{_probe_host(args.host)}:{args.port}/health"
     healthy_scheme = wait_for_health(health_url)
     if not healthy_scheme:
         raise RuntimeError(

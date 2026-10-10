@@ -209,10 +209,27 @@ def _stub_main_up_to_preflight(monkeypatch: pytest.MonkeyPatch, argv: list) -> N
         monkeypatch.delenv(name, raising=False)
 
 
-@pytest.mark.parametrize("host", ["", "0.0.0.0", "::", "[::]"])
-def test_already_serving_scheme_probes_localhost_for_wildcard(
-    monkeypatch: pytest.MonkeyPatch, host: str
+@pytest.mark.parametrize(
+    ("host", "probe_url"),
+    [
+        ("", "http://127.0.0.1:8787/health"),
+        ("0.0.0.0", "http://127.0.0.1:8787/health"),
+        ("127.0.0.1", "http://127.0.0.1:8787/health"),
+        ("::", "http://[::1]:8787/health"),
+        ("[::]", "http://[::1]:8787/health"),
+        ("localhost", "http://localhost:8787/health"),
+    ],
+)
+def test_already_serving_scheme_probes_the_configured_address(
+    monkeypatch: pytest.MonkeyPatch, host: str, probe_url: str
 ) -> None:
+    """The probe keeps the configured address, not the browser's localhost.
+
+    ``localhost`` is what the browser URL needs (session + passkey rpId), but
+    with ``HTTP_PROXY`` set and ``NO_PROXY=127.0.0.1`` only the numeric address
+    bypasses the proxy, so a health check on ``localhost`` would be answered by
+    the proxy instead of the running WebUI (review #8112).
+    """
     seen: list = []
 
     def fake_wait(url: str, timeout: float = 0.0, **kwargs: object) -> str:
@@ -222,7 +239,27 @@ def test_already_serving_scheme_probes_localhost_for_wildcard(
 
     monkeypatch.setattr(bootstrap, "wait_for_health", fake_wait)
     assert bootstrap._already_serving_scheme(host, 8787) == "http"
-    assert seen == [("http://localhost:8787/health", 1.0)]
+    assert seen == [(probe_url, 1.0)]
+
+
+def test_probe_host_keeps_the_configured_address() -> None:
+    """``_probe_host`` must not collapse into ``_url_host``.
+
+    The browser origin stays ``localhost`` (session in localStorage, passkey
+    rpId), while the probes stay on the address the user's ``NO_PROXY`` covers.
+    """
+    assert bootstrap._probe_host("127.0.0.1") == "127.0.0.1"
+    assert bootstrap._probe_host("localhost") == "localhost"
+    assert bootstrap._probe_host("") == "127.0.0.1"
+    assert bootstrap._probe_host("0.0.0.0") == "127.0.0.1"
+    assert bootstrap._probe_host("::") == "[::1]"
+    assert bootstrap._probe_host("[::]") == "[::1]"
+    assert bootstrap._probe_host("::1") == "[::1]"
+    assert bootstrap._probe_host("[::1]") == "[::1]"
+    assert bootstrap._probe_host("192.168.1.5") == "192.168.1.5"
+    # the browser URLs are untouched by the probe fix
+    assert bootstrap._url_host("127.0.0.1") == "localhost"
+    assert bootstrap._url_host("::1") == "[::1]"
 
 
 def test_already_serving_scheme_empty_when_nothing_answers(
