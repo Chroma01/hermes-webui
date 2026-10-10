@@ -3,6 +3,7 @@ import base64
 import json
 import logging
 import os
+import shlex
 import subprocess
 import threading
 import time
@@ -2226,16 +2227,27 @@ _GUI_TEST_BASIC = 'Basic ' + base64.b64encode(b'user:secret').decode()
 
 
 def _disposable_git_home(tmp_path, monkeypatch):
-    """Point git at a disposable home and install a configured GUI helper.
+    """Point git at disposable config scopes and install a configured GUI helper.
 
     Git Credential Manager on Windows owns the truth for the dialog; in the
     report it was a configured ``credential.helper``, so the fixture is
-    installed as one. It goes in the disposable home's ``~/.gitconfig`` because
-    the non-interactive path deliberately scrubs ``GIT_CONFIG_GLOBAL`` /
+    installed as one, in a disposable home's ``~/.gitconfig``. The
+    non-interactive path deliberately scrubs ``GIT_CONFIG_GLOBAL`` /
     ``GIT_CONFIG_SYSTEM`` from the child environment (an inherited override must
-    not be able to redirect git's config), while ``HOME`` / ``USERPROFILE`` are
-    inherited — so the user scope follows the disposable home and the machine's
+    not be able to redirect git's config), so ``HOME`` / ``USERPROFILE`` /
+    ``XDG_CONFIG_HOME`` are what make the scopes disposable here: the machine's
     real user config is neither read nor written.
+
+    Three details keep the scene hermetic and honest:
+
+    - an empty ``credential.helper`` entry comes FIRST, so trusted helpers that
+      the machine's system scope contributes cannot preempt the fixture;
+    - the fixture is added as a shell command with the path quoted, so a
+      ``tmp_path`` containing spaces still runs it (Git splits an unquoted
+      value);
+    - the inherited ``GCM_INTERACTIVE`` is set to ``always``, so only the
+      production assignment can downgrade it — otherwise an environment that
+      already said ``never`` would keep a broken guard passing.
 
     The fixture encodes GCM's documented contract: a cached credential is
     returned without interaction, and with interaction disabled the helper
@@ -2243,12 +2255,16 @@ def _disposable_git_home(tmp_path, monkeypatch):
     """
     home = tmp_path / 'git-home'
     home.mkdir()
+    xdg = home / 'xdg'
+    xdg.mkdir()
     cache = home / 'credentials'
     prompted = home / 'prompted'
+    invoked = home / 'invoked'
     helper = home / 'gui-credential-helper.sh'
     helper.write_text(
         '#!/bin/sh\n'
         'case "$1" in get) ;; *) exit 0 ;; esac\n'
+        f'echo "$1" >> "{invoked.as_posix()}"\n'
         'if [ -f "$FAKE_GUI_CACHE" ]; then cat "$FAKE_GUI_CACHE"; exit 0; fi\n'
         'if [ "$GCM_INTERACTIVE" = "never" ]; then exit 1; fi\n'
         f'touch "{prompted.as_posix()}"\n'
@@ -2257,14 +2273,22 @@ def _disposable_git_home(tmp_path, monkeypatch):
     )
     helper.chmod(0o755)
     (home / '.gitconfig').write_text(
-        '[credential]\n\thelper = ' + helper.as_posix() + '\n', encoding='utf-8'
+        '[credential]\n'
+        '\thelper =\n'
+        # Git strips a surrounding double quote from a config value, so the path
+        # must be quoted for the shell, not for the parser: `!` runs the rest
+        # through sh, where shlex.quote keeps spaces (and any embedded quote) intact.
+        f'\thelper = !{shlex.quote(helper.as_posix())}\n',
+        encoding='utf-8',
     )
     monkeypatch.setenv('HOME', str(home))
     monkeypatch.setenv('USERPROFILE', str(home))          # native Windows
     monkeypatch.setenv('HOMEDRIVE', str(home)[:2])
     monkeypatch.setenv('HOMEPATH', str(home)[2:])
+    monkeypatch.setenv('XDG_CONFIG_HOME', str(xdg))       # POSIX user scope
+    monkeypatch.setenv('GCM_INTERACTIVE', 'always')
     monkeypatch.setenv('FAKE_GUI_CACHE', str(cache))
-    return helper, cache, prompted
+    return helper, cache, prompted, invoked
 
 
 def _auth_static_server(serve_root, requests_seen):
@@ -2325,7 +2349,7 @@ def test_run_git_uses_a_configured_gui_credential_helper_without_prompting(
     variable. A background update check must fail closed instead of letting
     that helper raise a window.
     """
-    _helper, cache, prompted = _disposable_git_home(tmp_path, monkeypatch)
+    _helper, cache, prompted, invoked = _disposable_git_home(tmp_path, monkeypatch)
     assert not cache.exists(), 'this case is the no-cached-credential path'
     requests_seen = []
     server = _auth_static_server(tmp_path, requests_seen)
@@ -2339,6 +2363,7 @@ def test_run_git_uses_a_configured_gui_credential_helper_without_prompting(
         server.server_close()
 
     assert requests_seen, 'the fetch never reached the remote, so this proves nothing'
+    assert invoked.exists(), 'the configured helper never ran, so this proves nothing'
     assert not prompted.exists(), f'a credential prompt was launched: {out!r}'
     assert ok is False, out
     assert elapsed < 30, f'the fetch consumed the whole timeout: {elapsed:.1f}s'
@@ -2348,7 +2373,7 @@ def test_run_git_still_authenticates_with_a_cached_credential(
     tmp_path, monkeypatch
 ):
     """Disabling interaction must keep cached credentials working (#8048)."""
-    _helper, cache, prompted = _disposable_git_home(tmp_path, monkeypatch)
+    _helper, cache, prompted, invoked = _disposable_git_home(tmp_path, monkeypatch)
     cache.write_text('username=user\npassword=secret\n', encoding='utf-8')
     requests_seen = []
     server = _auth_static_server(tmp_path, requests_seen)
@@ -2361,4 +2386,5 @@ def test_run_git_still_authenticates_with_a_cached_credential(
 
     assert ok is True, out
     assert len(requests_seen) >= 2, f'no credential round trip: {requests_seen}'
+    assert invoked.exists(), 'the configured helper never ran, so this proves nothing'
     assert not prompted.exists(), f'a credential prompt was launched: {out!r}'
