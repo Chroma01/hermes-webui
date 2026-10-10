@@ -6,6 +6,8 @@ import contextlib
 import errno
 import http.server
 import socket
+import ssl
+import subprocess
 import sys
 import threading
 from collections.abc import Iterator
@@ -33,11 +35,12 @@ class _StubSocket:
         self.family = family
         self.sock_type = sock_type
         self.bind_calls: list[tuple] = []
+        self.opts: list[tuple] = []
         self.closed = False
         _StubSocket.instances.append(self)
 
     def setsockopt(self, *args: object, **kwargs: object) -> None:
-        return None
+        self.opts.append(tuple(args))
 
     def bind(self, address: tuple) -> None:
         self.bind_calls.append(address)
@@ -252,7 +255,8 @@ def test_occupied_port_with_healthy_webui_opens_browser(
     monkeypatch.setattr(bootstrap, "open_browser", opened.append)
 
     assert bootstrap.main() == 0
-    assert opened == ["http://localhost:" + str(bootstrap.DEFAULT_PORT)]
+    # --host 127.0.0.1 is a reachable URL host, so it is kept verbatim.
+    assert opened == [f"http://127.0.0.1:{bootstrap.DEFAULT_PORT}"]
 
 
 def test_occupied_port_by_foreign_listener_still_errors(
@@ -282,7 +286,7 @@ def test_occupied_port_in_foreground_reports_our_own_instance(
         bootstrap.main()
     message = str(excinfo.value)
     assert (
-        f"Hermes WebUI is already running at http://localhost:{bootstrap.DEFAULT_PORT}"
+        f"Hermes WebUI is already running at http://127.0.0.1:{bootstrap.DEFAULT_PORT}"
         in message
     )
     assert "Stop that instance first" in message
@@ -329,10 +333,13 @@ def test_port_conflict_raises_the_dedicated_error(
 
 
 @contextlib.contextmanager
-def _serve(body: bytes, status: int = 200) -> Iterator[int]:
+def _serve(
+    body: bytes, status: int = 200, cert: str | None = None, key: str | None = None
+) -> Iterator[int]:
     """A /health listener that answers ``status`` with exactly ``body``.
 
-    Yields the port; the server runs on a background thread.
+    Yields the port; the server runs on a background thread. ``cert``/``key``
+    wrap the socket in TLS, making it an HTTPS-only listener.
     """
 
     class _Handler(http.server.BaseHTTPRequestHandler):
@@ -346,6 +353,10 @@ def _serve(body: bytes, status: int = 200) -> Iterator[int]:
             return None
 
     with http.server.HTTPServer(("127.0.0.1", 0), _Handler) as httpd:
+        if cert and key:
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ctx.load_cert_chain(cert, key)
+            httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
         port = httpd.server_address[1]
         thread = threading.Thread(target=httpd.serve_forever, daemon=True)
         thread.start()
@@ -413,3 +424,139 @@ def test_degraded_answer_is_not_ready_for_the_health_wait() -> None:
         assert bootstrap._health_ok(
             url, markers=bootstrap._HERMES_HEALTH_MARKERS, accept_degraded=True
         )
+
+
+# ---------- review follow-up (#8112, second round): URL hosts ----------------
+
+
+def test_url_host_maps_wildcards_and_brackets_ipv6() -> None:
+    assert bootstrap._url_host("") == "localhost"
+    assert bootstrap._url_host("0.0.0.0") == "localhost"
+    assert bootstrap._url_host("::") == "localhost"
+    assert bootstrap._url_host("[::]") == "localhost"
+    assert bootstrap._url_host("::1") == "[::1]"
+    assert bootstrap._url_host("[::1]") == "[::1]"
+    assert bootstrap._url_host("127.0.0.1") == "127.0.0.1"
+    assert bootstrap._url_host("192.168.1.5") == "192.168.1.5"
+
+
+def test_already_serving_scheme_brackets_ipv6_probe_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`--host ::1` must probe http://[::1]:port/health, not http://::1:port."""
+    seen: list = []
+
+    def fake_wait(url: str, timeout: float = 0.0, **kwargs: object) -> str:
+        seen.append(url)
+        assert kwargs.get("tls_unknown") is True
+        return "http"
+
+    monkeypatch.setattr(bootstrap, "wait_for_health", fake_wait)
+    assert bootstrap._already_serving_scheme("::1", 8787) == "http"
+    assert seen == ["http://[::1]:8787/health"]
+
+
+@pytest.mark.parametrize(
+    "host, url_host",
+    [("::1", "[::1]"), ("0.0.0.0", "localhost")],
+)
+def test_occupied_port_url_uses_a_reachable_host(
+    monkeypatch: pytest.MonkeyPatch, host: str, url_host: str
+) -> None:
+    """The opened URL of a running own WebUI must be openable, not http://::1."""
+    _stub_main_up_to_preflight(monkeypatch, ["--host", host])
+    monkeypatch.setattr(bootstrap, "_check_port_available", _raise_in_use)
+    monkeypatch.setattr(bootstrap, "_already_serving_scheme", lambda h, p: "https")
+    opened: list = []
+    monkeypatch.setattr(bootstrap, "open_browser", opened.append)
+
+    assert bootstrap.main() == 0
+    assert opened == [f"https://{url_host}:{bootstrap.DEFAULT_PORT}"]
+
+
+def test_occupied_port_in_foreground_names_bracketed_ipv6(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_main_up_to_preflight(monkeypatch, ["--foreground", "--host", "::1"])
+    monkeypatch.setattr(bootstrap, "_check_port_available", _raise_in_use)
+    monkeypatch.setattr(bootstrap, "_already_serving_scheme", lambda h, p: "http")
+
+    with pytest.raises(RuntimeError) as excinfo:
+        bootstrap.main()
+    assert (
+        f"Hermes WebUI is already running at http://[::1]:{bootstrap.DEFAULT_PORT}"
+        in str(excinfo.value)
+    )
+
+
+# ---------- review follow-up (#8112, second round): bind flags -------------
+
+
+@pytest.mark.parametrize("probe", ["_check_port_available", "_port_is_available"])
+def test_windows_preflight_binds_like_the_server(
+    monkeypatch: pytest.MonkeyPatch, probe: str
+) -> None:
+    """On Windows the check must not reuse the address (server.py's own flags).
+
+    With SO_REUSEADDR the check binds a port another listener holds and the
+    real bind fails later, after dependencies and state exist (review #8112).
+    """
+    _StubSocket.instances = []
+    monkeypatch.setattr(bootstrap.socket, "socket", _StubSocket)
+    monkeypatch.setattr(sys, "platform", "win32")
+    if probe == "_check_port_available":
+        bootstrap._check_port_available("127.0.0.1", 8787)
+    else:
+        assert bootstrap._port_is_available("127.0.0.1", 8787) is True
+    opts = _StubSocket.instances[-1].opts
+    assert (socket.SOL_SOCKET, socket.SO_REUSEADDR, 0) in opts
+    assert (socket.SOL_SOCKET, getattr(socket, "SO_EXCLUSIVEADDRUSE", -5), 1) in opts
+
+
+def test_posix_preflight_keeps_address_reuse(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Off Windows the flags are unchanged: reuse on, no exclusive flag."""
+    _StubSocket.instances = []
+    monkeypatch.setattr(bootstrap.socket, "socket", _StubSocket)
+    monkeypatch.setattr(sys, "platform", "linux")
+    bootstrap._check_port_available("127.0.0.1", 8787)
+    opts = _StubSocket.instances[-1].opts
+    assert (socket.SOL_SOCKET, socket.SO_REUSEADDR, 1) in opts
+    assert not any(o[1] == getattr(socket, "SO_EXCLUSIVEADDRUSE", -5) for o in opts)
+
+
+# ---------- review follow-up (#8112, second round): HTTPS-only WebUI --------
+
+_WEBUI_HEALTH_BODY = (
+    b'{"status": "ok", "sessions": 0, "server_started_at": 1.0, '
+    b'"uptime_seconds": 1.0}'
+)
+
+
+def _self_signed_cert(tmp_path: Path) -> tuple[str, str]:
+    cert = str(tmp_path / "cert.pem")
+    key = str(tmp_path / "key.pem")
+    subprocess.run(
+        [
+            "openssl", "req", "-x509", "-newkey", "rsa:2048", "-keyout", key,
+            "-out", cert, "-days", "1", "-nodes", "-subj", "/CN=localhost",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    return cert, key
+
+
+def test_https_only_webui_is_recognised(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An own WebUI serving HTTPS is ours even with no TLS env in this shell.
+
+    The running instance may have taken its TLS settings from another launcher
+    or an earlier shell; probing HTTP alone reported the healthy instance as a
+    foreign conflict (review #8112, fix 3).
+    """
+    cert, key = _self_signed_cert(tmp_path)
+    monkeypatch.delenv("HERMES_WEBUI_TLS_CERT", raising=False)
+    monkeypatch.delenv("HERMES_WEBUI_TLS_KEY", raising=False)
+    with _serve(_WEBUI_HEALTH_BODY, cert=cert, key=key) as port:
+        assert bootstrap._already_serving_scheme("127.0.0.1", port) == "https"

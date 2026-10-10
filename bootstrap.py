@@ -444,6 +444,7 @@ def wait_for_health(
     timeout: float = 25.0,
     markers: tuple[bytes, ...] = (),
     accept_degraded: bool = False,
+    tls_unknown: bool = False,
 ) -> str:
     """Poll /health until the server answers ok or the timeout elapses.
 
@@ -470,6 +471,12 @@ def wait_for_health(
 
     HERMES_WEBUI_TLS_INSECURE_PROBE=1 is an explicit opt-in that skips the
     verified attempt and stays silent by contract.
+
+    ``tls_unknown=True`` is for a port whose server we did not start (the
+    occupied-port check): its TLS settings may live in another launcher or an
+    earlier shell, so HTTPS is tried first WITHOUT certificate verification -
+    silently, since a local self-signed certificate is expected - and HTTP
+    second, instead of letting the local TLS env decision pick one scheme.
     """
     # Validate URL scheme to prevent file:// and other dangerous schemes
     if not url.startswith(("http://", "https://")):
@@ -485,8 +492,10 @@ def wait_for_health(
         )
 
     deadline = time.time() + timeout
-    https = _tls_probe_enabled()
-    insecure_optin = _truthy(os.getenv("HERMES_WEBUI_TLS_INSECURE_PROBE"))
+    https = _tls_probe_enabled() or tls_unknown
+    insecure_optin = (
+        _truthy(os.getenv("HERMES_WEBUI_TLS_INSECURE_PROBE")) or tls_unknown
+    )
     # Derive host:port/path from the passed URL, then build scheme-correct URLs.
     parsed = urllib.parse.urlsplit(url)
     authority = parsed.netloc
@@ -639,17 +648,40 @@ def _bind_host_for_check(host: str) -> str:
     return host
 
 
+def _apply_bind_flags(sock: socket.socket) -> None:
+    """Give a check socket the same options as the server's own bind.
+
+    Windows needs ``SO_EXCLUSIVEADDRUSE`` and no address reuse: with
+    ``SO_REUSEADDR`` a second socket may bind a port another listener holds
+    without exclusive use, so a busy port would pass the check and the real
+    bind would only fail later, after dependencies and state exist (review
+    #8112). ``server.py::QuietHTTPServer.server_bind`` makes this exact choice
+    for the binding socket; the check must not be laxer than the bind it
+    predicts.
+    """
+    if sys.platform == "win32":
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)
+        sock.setsockopt(
+            socket.SOL_SOCKET, getattr(socket, "SO_EXCLUSIVEADDRUSE", -5), 1
+        )
+    else:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+
+
 def _port_is_available(host: str, port: int) -> bool:
     """Return True iff a TCP socket can bind host:port right now.
 
     Point-in-time check only: a successful bind here does not guarantee the
     server's later bind will succeed (another process may grab the port in
     between). Actual bind failures remain authoritative.
+
+    Binds with ``_apply_bind_flags``, so the check fails where the real
+    bind does (Windows in particular).
     """
     family = socket.AF_INET6 if ":" in host else socket.AF_INET
     sock = socket.socket(family, socket.SOCK_STREAM)
     try:
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        _apply_bind_flags(sock)
         sock.bind((host, port))
         return True
     except OSError:
@@ -692,7 +724,7 @@ def _check_port_available(host: str, port: int) -> None:
     # port on any interface is caught here instead of after installation.
     sock = socket.socket(family, socket.SOCK_STREAM)
     try:
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        _apply_bind_flags(sock)
         sock.bind((check_host, port))
         return
     except OSError as exc:
@@ -724,6 +756,23 @@ def _check_port_available(host: str, port: int) -> None:
         sock.close()
 
 
+def _url_host(host: str) -> str:
+    """A configured host as it must appear inside a URL.
+
+    Wildcard binds ("", "0.0.0.0", "::", "[::]") mean "every interface",
+    which is not a reachable URL host, so they map to localhost - the address
+    a wildcard-bound server answers on. IPv6 literals need brackets:
+    ``http://::1:8787`` parses the last address group as the port, so the
+    health probe, the printed URL and the browser open all miss the running
+    server (review #8112).
+    """
+    if host in ("", "0.0.0.0", "::", "[::]"):
+        return "localhost"
+    if ":" in host and not host.startswith("["):
+        return f"[{host}]"
+    return host
+
+
 def _already_serving_scheme(host: str, port: int) -> str:
     """Scheme of a healthy Hermes WebUI already answering on host:port, else "".
 
@@ -739,14 +788,17 @@ def _already_serving_scheme(host: str, port: int) -> str:
     that port is a foreign listener, so bootstrap keeps reporting the
     conflict. A degraded own WebUI answers 503 with the same payload and is
     still that instance, so the probe accepts any status here
-    (``accept_degraded=True``).
+    (``accept_degraded=True``). Both schemes are tried (``tls_unknown=True``):
+    the running instance may serve HTTPS with settings from another launcher
+    or an earlier shell, which this process cannot see in its own env.
     """
-    probe_host = "localhost" if host in ("", "0.0.0.0", "::", "[::]") else host
+    probe_host = _url_host(host)
     return wait_for_health(
         f"http://{probe_host}:{port}/health",
         timeout=1.0,
         markers=_HERMES_HEALTH_MARKERS,
         accept_degraded=True,
+        tls_unknown=True,
     )
 
 
@@ -768,11 +820,7 @@ def main() -> int:
         _scheme = _already_serving_scheme(args.host, args.port)
         if not _scheme:
             raise
-        _url = (
-            f"{_scheme}://localhost:{args.port}"
-            if args.host in ("127.0.0.1", "localhost")
-            else f"{_scheme}://{args.host}:{args.port}"
-        )
+        _url = f"{_scheme}://{_url_host(args.host)}:{args.port}"
         # A foreground/supervisor launch would be a second server on the same
         # port, so it still fails - with advice about its OWN instance
         # (review #8112, should-fix): the port-conflict text ("try
@@ -823,7 +871,7 @@ def main() -> int:
     foreground_reason = "--foreground" if args.foreground else _detect_supervisor()
     if foreground_reason:
         info(
-            f"Starting Hermes Web UI on {scheme}://{args.host}:{args.port} "
+            f"Starting Hermes Web UI on {scheme}://{_url_host(args.host)}:{args.port} "
             f"(foreground mode: {foreground_reason})"
         )
         try:
@@ -890,7 +938,7 @@ def main() -> int:
     # /health, then return. Suitable for an interactive `bash start.sh` run.
     log_path = state_dir / f"bootstrap-{args.port}.log"
 
-    info(f"Starting Hermes Web UI on {scheme}://{args.host}:{args.port}")
+    info(f"Starting Hermes Web UI on {scheme}://{_url_host(args.host)}:{args.port}")
     with log_path.open("ab") as log_file:
         proc = subprocess.Popen(
             [python_exe, server_path],
@@ -901,7 +949,7 @@ def main() -> int:
             start_new_session=True,
         )
 
-    health_url = f"{scheme}://{args.host}:{args.port}/health"
+    health_url = f"{scheme}://{_url_host(args.host)}:{args.port}/health"
     healthy_scheme = wait_for_health(health_url)
     if not healthy_scheme:
         raise RuntimeError(
@@ -913,11 +961,7 @@ def main() -> int:
     # scheme that actually answered the probe is the one the server is reachable
     # on — use it for the ready URL and browser-open, not the configured scheme.
     ready_scheme = healthy_scheme or scheme
-    app_url = (
-        f"{ready_scheme}://localhost:{args.port}"
-        if args.host in ("127.0.0.1", "localhost")
-        else f"{ready_scheme}://{args.host}:{args.port}"
-    )
+    app_url = f"{ready_scheme}://{_url_host(args.host)}:{args.port}"
     info(f"Web UI is ready: {app_url}")
     info(f"Log file: {log_path}")
     if not args.no_browser:
