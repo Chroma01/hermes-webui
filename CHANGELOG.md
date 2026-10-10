@@ -135,6 +135,8 @@
 
 ### Fixed
 
+- **Codex sign-in sends an explicit User-Agent on its device-code requests**, so the OAuth endpoint no longer
+  sees a bare library default. Thanks @angelusbr. (#8118)
 - **A conversation no longer gets stuck on "session already has an active stream".** A tab that went away without a
   clean disconnect (a half-open connection) kept its session channel alive for the life of the server, and a stream left
   behind by a worker that exited without cleaning up blocked every new message in that conversation, sometimes for hours.
