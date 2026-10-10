@@ -135,6 +135,10 @@
 
 ### Fixed
 
+- **Long conversations no longer show tool results twice after compression.** When the agent compressed old tool
+  output into a one-line summary, the WebUI kept the full result and also spliced the summary in next to it, so repeated
+  tool cards built up over many compressions. A tool row already on screen is now recognised by its durable row identity
+  and not added again. Thanks @psanger. (#7990)
 - **Starting the WebUI on a port that is already taken explains what to do.** `bootstrap.py` / `start.sh` now check the
   port before launching: if your own WebUI is already running there it says so (and opens it), otherwise it names the
   port as busy and suggests a free one instead of failing later with a bind error. Works for IPv4, IPv6 and HTTPS.
