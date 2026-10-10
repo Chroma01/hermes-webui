@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import errno
 import http.server
+import shutil
 import socket
 import ssl
 import subprocess
@@ -609,6 +610,10 @@ _WEBUI_HEALTH_BODY = (
 
 
 def _self_signed_cert(tmp_path: Path) -> tuple[str, str]:
+    # The certificate comes from the openssl CLI; without it (a stock Windows
+    # dev box) skip rather than fail with FileNotFoundError (Greptile on #8133).
+    if shutil.which("openssl") is None:
+        pytest.skip("openssl CLI not on PATH")
     cert = str(tmp_path / "cert.pem")
     key = str(tmp_path / "key.pem")
     subprocess.run(
