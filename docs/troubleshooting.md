@@ -35,23 +35,7 @@ management requests, not every scheduled execution.
 1. **Agent installed but not on `sys.path`.** Most common. The agent is checked out somewhere (e.g. `~/Programmes/hermes-agent`), the WebUI was launched with a Python that doesn't know about it, and there's no `pip install -e .` linking the two.
 2. **Symlink with a typo or wrong target.** A symlink to the agent looks correct on `ls`, but `readlink` resolves to a path that doesn't exist or doesn't contain `agent/__init__.py`.
 3. **`HERMES_WEBUI_AGENT_DIR` set to the wrong directory.** Override env var beats auto-discovery and points at a directory that has no agent code.
-4. **Agent installed as root, under the FHS layout.** When the Hermes Agent installer runs as root on Linux it places the agent at `/usr/local/lib/hermes-agent` (CLI linked into `/usr/local/bin`), not `~/.hermes/hermes-agent`. Older `bootstrap.py` didn't probe that path, so it built a WebUI-only `.venv` and failed at launch with **"Python environment cannot import both WebUI dependencies and Hermes Agent."** `git pull` to update the WebUI (current `bootstrap.py` auto-discovers the FHS layout and follows the `hermes` launcher to the agent), and follow the service's own lifecycle: on a package-managed install the agent's
-interpreter switch is part of startup when relaunch is enabled, so
-leaving the override unset still lands on the managed interpreter — provided
-that switch is actually enabled. When relaunch is enabled (the default:
-`HERMES_DISABLE_LAZY_INSTALLS` unset, `updateMechanism=self`, checkout with
-`.git`/`pyproject.toml`), launch preparation re-exec's a non-store interpreter
-into the store python before activation, so an unset override is safe. When the
-service suppresses relaunch — it sets `HERMES_DISABLE_LAZY_INSTALLS=1`, the
-install's update mechanism is not `self`, or the checkout lacks
-`.git`/`pyproject.toml` — no re-exec corrects the seed interpreter: an unset
-override falls back to the in-tree venv via `discover_launcher_python()` and
-every turn fails while the pre-flight check passes. Those services must resolve
-the store python fresh at every start — decode element zero of
-`hermes --print-runtime-command` in the service's own launch step (a systemd
-`ExecStart` wrapper or `EnvironmentFile` generator) and export it as
-`HERMES_WEBUI_PYTHON` — never the in-tree venv, and never a saved path of any
-kind either — see [Hermes package-managed runtime bootstrap order](#hermes-package-managed-runtime-bootstrap-order).
+4. **Agent installed as root, under the FHS layout.** When the Hermes Agent installer runs as root on Linux it places the agent at `/usr/local/lib/hermes-agent` (CLI linked into `/usr/local/bin`), not `~/.hermes/hermes-agent`. Older `bootstrap.py` didn't probe that path, so it built a WebUI-only `.venv` and failed at launch with **"Python environment cannot import both WebUI dependencies and Hermes Agent."** `git pull` to update the WebUI (current `bootstrap.py` auto-discovers the FHS layout and follows the `hermes` launcher to the agent), and let the launcher pick the interpreter: when relaunch is enabled (the default: `HERMES_DISABLE_LAZY_INSTALLS` unset, `updateMechanism=self`, checkout with `.git`/`pyproject.toml`), launch preparation re-exec's a non-store interpreter into the store python before activation, so leaving `HERMES_WEBUI_PYTHON` unset lands on the managed interpreter. When the service suppresses relaunch instead, no re-exec corrects the seed interpreter, and an unset override falls through `discover_launcher_python()` to whatever non-managed python it finds (`agent_dir/venv/bin/python` if it exists, else the WebUI `.venv`, else system `python3`) — every turn then fails while the pre-flight check still passes. Those services must resolve the store python fresh at every start and export it as `HERMES_WEBUI_PYTHON` (see step 2) — never the in-tree venv, and never a saved path of any kind — see [Hermes package-managed runtime bootstrap order](#hermes-package-managed-runtime-bootstrap-order).
 
 ### Step 1 — confirm the agent location
 
@@ -78,7 +62,16 @@ export HERMES_WEBUI_PYTHON=/absolute/path/to/working/python
 ./start.sh
 ```
 
-For a source checkout that path is the agent venv python (`.../hermes-agent/venv/bin/python`). For a package-managed install with relaunch enabled (the default: `HERMES_DISABLE_LAZY_INSTALLS` unset, `updateMechanism=self`, checkout with `.git`/`pyproject.toml`), leave `HERMES_WEBUI_PYTHON` unset whenever the launcher discovers the agent on its own — managed activation selects and leases the committed generation on every launch. Never persist a resolved path — neither a generation path (`installs/<key>/environments/<hash>/venv/bin/python`, garbage-collected once unselected) nor a store path (`tools/python-*`, superseded on managed-python updates): both stop being the interpreter the Agent runs on. If the service suppresses relaunch (e.g. it sets `HERMES_DISABLE_LAZY_INSTALLS=1`), leaving the override unset re-selects the in-tree venv — `discover_launcher_python()` prefers it and the pre-flight's pure-Python check passes on it while every turn fails. Those services must resolve the store python fresh at every start instead: decode element zero of `hermes --print-runtime-command` in the service's own launch step (a systemd `ExecStart` wrapper or `EnvironmentFile` generator) and export it as `HERMES_WEBUI_PYTHON` — never a saved path, never the pre-PM in-tree venv — see [Hermes package-managed runtime bootstrap order](#hermes-package-managed-runtime-bootstrap-order).
+For a source checkout that path is the agent venv python (`.../hermes-agent/venv/bin/python`). For a package-managed install with relaunch enabled (the default: `HERMES_DISABLE_LAZY_INSTALLS` unset, `updateMechanism=self`, checkout with `.git`/`pyproject.toml`), leave `HERMES_WEBUI_PYTHON` unset whenever the launcher discovers the agent on its own — managed activation selects and leases the committed generation on every launch. Never persist a resolved path — neither a generation path (`installs/<key>/environments/<hash>/venv/bin/python`, garbage-collected once unselected) nor a store path (`tools/python-*`, superseded on managed-python updates): both stop being the interpreter the Agent runs on. If the service suppresses relaunch (e.g. it sets `HERMES_DISABLE_LAZY_INSTALLS=1`), leaving the override unset re-selects a non-managed python — `discover_launcher_python()` prefers `agent_dir/venv/bin/python` when it exists (else the WebUI `.venv`, else system `python3`) and the pre-flight's pure-Python check passes on it while every turn fails. Those services must resolve the store python fresh at every start instead: `hermes --print-runtime-command` prints a JSON array whose element zero is the store python, so decode it in the service's own launch step (a systemd `ExecStart` wrapper or `EnvironmentFile` generator) and export it as `HERMES_WEBUI_PYTHON`:
+
+```bash
+# both forms read the JSON array and take element zero
+export HERMES_WEBUI_PYTHON="$(hermes --print-runtime-command \
+  | python3 -c 'import json, sys; print(json.load(sys.stdin)[0])')"
+export HERMES_WEBUI_PYTHON="$(hermes --print-runtime-command | jq -r '.[0]')"
+```
+
+A wrong extraction (e.g. `cut -d, -f1`) yields a truncated path that fails loudly when the launcher execs it — never a saved path, never the pre-PM in-tree venv — see [Hermes package-managed runtime bootstrap order](#hermes-package-managed-runtime-bootstrap-order).
 
 ### Step 3 — install the agent in editable mode
 
@@ -195,14 +188,25 @@ once unselected, and a saved store path (`tools/python-*`) is superseded on the
 next managed-python update — in both cases the next `start.sh` launches an
 interpreter the Agent no longer runs on. If an override is unavoidable — or the
 service suppresses relaunch (e.g. it sets `HERMES_DISABLE_LAZY_INSTALLS=1`, in
-which case an unset override falls back to the in-tree venv) — resolve the
-store python fresh at every start: decode element zero of
-`hermes --print-runtime-command` in the service's own launch step (a systemd
-`ExecStart` wrapper or `EnvironmentFile` generator) and export it as
-`HERMES_WEBUI_PYTHON`. That resolves per-launch instead of persisting a
-versioned path. Run it with the service's `HERMES_HOME`
-when the install uses a non-default home (per-user installs live at
-`~/.hermes/hermes-agent`; the FHS path above is the root-on-Linux layout only).
+which case an unset override falls through `discover_launcher_python()` to a
+non-managed python) — resolve the store python fresh at every start and export
+it as `HERMES_WEBUI_PYTHON`. `hermes --print-runtime-command` prints a JSON
+array whose element zero is the store python; decode it in the service's own
+launch step (a systemd `ExecStart` wrapper or `EnvironmentFile` generator):
+
+```bash
+# both forms read the JSON array and take element zero
+export HERMES_WEBUI_PYTHON="$(hermes --print-runtime-command \
+  | python3 -c 'import json, sys; print(json.load(sys.stdin)[0])')"
+export HERMES_WEBUI_PYTHON="$(hermes --print-runtime-command | jq -r '.[0]')"
+```
+
+That resolves per-launch instead of persisting a versioned path. Run it with
+the service's `HERMES_HOME` when the install uses a non-default home (per-user
+installs live at `~/.hermes/hermes-agent`; the FHS path above is the
+root-on-Linux layout only), and with the service's `HERMES_RUNTIME_DIR` when it
+sets one — the runtime override also steers `store_root()`, so a resolver run
+without it can point at a different store than the service uses.
 
 The bare store python needs no workaround either: run through `bootstrap.py`'s
 pre-flight `_python_can_run_webui_and_agent()` probe it behaves like any managed
