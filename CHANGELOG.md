@@ -139,6 +139,18 @@
   authenticator that includes CBOR extension data no longer fails with "Trailing CBOR data"; malformed extension bytes
   are rejected cleanly instead of causing a server error. Existing passkeys keep working. Thanks @Dandandad. (#8093, #8092)
 
+- **Codex sign-in sends an explicit User-Agent on its device-code requests**, so the OAuth endpoint no longer
+  sees a bare library default. Thanks @angelusbr. (#8118)
+
+- **A reply line that legitimately repeats earlier text is no longer hidden while it streams.** Echo suppression used to
+  match on text alone, so two different events with the same words (for example "Processing…" on both sides of a tool
+  call) collapsed into one. Rows are now de-duplicated by their identity, and only a genuinely re-delivered row is
+  dropped. Thanks @webtecnica. (#6293)
+- **A conversation no longer gets stuck on "session already has an active stream".** A tab that went away without a
+  clean disconnect (a half-open connection) kept its session channel alive for the life of the server, and a stream left
+  behind by a worker that exited without cleaning up blocked every new message in that conversation, sometimes for hours.
+  Abandoned channels are now collected once their subscribers stop draining, a new message clears a stream whose worker
+  is gone, and a restored Gateway run claims its ownership before it starts. Thanks @PeterPunk1320. (#7302)
 - **A closed mobile sidebar or workspace drawer is out of the keyboard's way.** Once a drawer has slid closed it is
   inert and hidden from the tab order and screen readers, so Tab no longer walks into an invisible off-screen list;
   closing it by tapping outside or with its own close button returns focus to the control that opened it, and the
