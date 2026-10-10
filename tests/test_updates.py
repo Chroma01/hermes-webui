@@ -1,11 +1,12 @@
 """Tests for self-update diagnostics (api/updates.py)."""
+import base64
 import json
 import logging
 import os
 import subprocess
 import threading
 import time
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer, SimpleHTTPRequestHandler
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -2217,3 +2218,147 @@ def test_check_repo_attaches_recovery_hints(tmp_path, monkeypatch):
     assert info is not None
     assert info.get('stale_check') is True
     assert info['recovery'] == {'force': True, 'clear_lock': False}
+
+
+# --- Configured GUI credential helper on the update path (#8048) --------------
+
+_GUI_TEST_BASIC = 'Basic ' + base64.b64encode(b'user:secret').decode()
+
+
+def _disposable_git_home(tmp_path, monkeypatch):
+    """Point git at a disposable home and install a configured GUI helper.
+
+    Git Credential Manager on Windows owns the truth for the dialog; in the
+    report it was a configured ``credential.helper``, so the fixture is
+    installed as one. It goes in the disposable home's ``~/.gitconfig`` because
+    the non-interactive path deliberately scrubs ``GIT_CONFIG_GLOBAL`` /
+    ``GIT_CONFIG_SYSTEM`` from the child environment (an inherited override must
+    not be able to redirect git's config), while ``HOME`` / ``USERPROFILE`` are
+    inherited — so the user scope follows the disposable home and the machine's
+    real user config is neither read nor written.
+
+    The fixture encodes GCM's documented contract: a cached credential is
+    returned without interaction, and with interaction disabled the helper
+    refuses instead of prompting.
+    """
+    home = tmp_path / 'git-home'
+    home.mkdir()
+    cache = home / 'credentials'
+    prompted = home / 'prompted'
+    helper = home / 'gui-credential-helper.sh'
+    helper.write_text(
+        '#!/bin/sh\n'
+        'case "$1" in get) ;; *) exit 0 ;; esac\n'
+        'if [ -f "$FAKE_GUI_CACHE" ]; then cat "$FAKE_GUI_CACHE"; exit 0; fi\n'
+        'if [ "$GCM_INTERACTIVE" = "never" ]; then exit 1; fi\n'
+        f'touch "{prompted.as_posix()}"\n'
+        'exit 1\n',
+        encoding='utf-8',
+    )
+    helper.chmod(0o755)
+    (home / '.gitconfig').write_text(
+        '[credential]\n\thelper = ' + helper.as_posix() + '\n', encoding='utf-8'
+    )
+    monkeypatch.setenv('HOME', str(home))
+    monkeypatch.setenv('USERPROFILE', str(home))          # native Windows
+    monkeypatch.setenv('HOMEDRIVE', str(home)[:2])
+    monkeypatch.setenv('HOMEPATH', str(home)[2:])
+    monkeypatch.setenv('FAKE_GUI_CACHE', str(cache))
+    return helper, cache, prompted
+
+
+def _auth_static_server(serve_root, requests_seen):
+    """Serve a bare repository over dumb HTTP behind HTTP Basic auth."""
+
+    class _AuthStaticHandler(SimpleHTTPRequestHandler):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, directory=str(serve_root), **kwargs)
+
+        def do_GET(self):  # noqa: N802 - stdlib handler naming
+            requests_seen.append(self.headers.get('Authorization'))
+            if self.headers.get('Authorization') != _GUI_TEST_BASIC:
+                self.send_response(401)
+                self.send_header('WWW-Authenticate', 'Basic realm="git"')
+                self.send_header('Content-Length', '0')
+                self.end_headers()
+                return
+            super().do_GET()
+
+        def log_message(self, *args):
+            pass
+
+    server = HTTPServer(('127.0.0.1', 0), _AuthStaticHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server
+
+
+def _seed_origin_and_clone(tmp_path, port):
+    """Create a bare origin served over HTTP and a clone that points at it."""
+    origin = tmp_path / 'origin.git'
+    _git(tmp_path, 'init', '--bare', '-q', str(origin))
+    seed = tmp_path / 'seed'
+    seed.mkdir()
+    _git(seed, 'init', '-q')
+    _git(seed, 'config', 'user.email', 't@t.co')
+    _git(seed, 'config', 'user.name', 'Test')
+    (seed / 'file.txt').write_text('content\n', encoding='utf-8')
+    _git(seed, 'add', 'file.txt')
+    _git(seed, 'commit', '-q', '-m', 'seed')
+    _git(seed, 'remote', 'add', 'origin', str(origin))
+    _git(seed, 'push', '-q', 'origin', 'HEAD:refs/heads/main')
+    _git(origin, 'update-server-info')          # advertise refs for dumb HTTP
+
+    repo = tmp_path / 'repo'
+    repo.mkdir()
+    _git(repo, 'init', '-q')
+    _git(repo, 'remote', 'add', 'origin', f'http://127.0.0.1:{port}/origin.git')
+    return repo
+
+
+def test_run_git_uses_a_configured_gui_credential_helper_without_prompting(
+    tmp_path, monkeypatch
+):
+    """A configured GUI helper must not be able to open a prompt (#8048).
+
+    The reported scene: the trusted helper was Git Credential Manager (a
+    ``credential.helper`` in the user scope), not an inherited askpass
+    variable. A background update check must fail closed instead of letting
+    that helper raise a window.
+    """
+    _helper, cache, prompted = _disposable_git_home(tmp_path, monkeypatch)
+    assert not cache.exists(), 'this case is the no-cached-credential path'
+    requests_seen = []
+    server = _auth_static_server(tmp_path, requests_seen)
+    try:
+        repo = _seed_origin_and_clone(tmp_path, server.server_address[1])
+        started = time.monotonic()
+        out, ok = updates._run_git(['fetch', 'origin'], repo, timeout=30)
+        elapsed = time.monotonic() - started
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert requests_seen, 'the fetch never reached the remote, so this proves nothing'
+    assert not prompted.exists(), f'a credential prompt was launched: {out!r}'
+    assert ok is False, out
+    assert elapsed < 30, f'the fetch consumed the whole timeout: {elapsed:.1f}s'
+
+
+def test_run_git_still_authenticates_with_a_cached_credential(
+    tmp_path, monkeypatch
+):
+    """Disabling interaction must keep cached credentials working (#8048)."""
+    _helper, cache, prompted = _disposable_git_home(tmp_path, monkeypatch)
+    cache.write_text('username=user\npassword=secret\n', encoding='utf-8')
+    requests_seen = []
+    server = _auth_static_server(tmp_path, requests_seen)
+    try:
+        repo = _seed_origin_and_clone(tmp_path, server.server_address[1])
+        out, ok = updates._run_git(['fetch', 'origin'], repo, timeout=60)
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert ok is True, out
+    assert len(requests_seen) >= 2, f'no credential round trip: {requests_seen}'
+    assert not prompted.exists(), f'a credential prompt was launched: {out!r}'
