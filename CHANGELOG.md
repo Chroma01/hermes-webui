@@ -135,6 +135,11 @@
 
 ### Fixed
 
+- **The "Move to project" picker is keyboard-reachable, translated and finger-sized.** Arrow keys, Home, End and Escape work (focus
+  returns to the ⋮ trigger), labels are translated in all 15 locales, and rows are 44px on touch. The picker uses the same placement
+  as the ⋮ menu (below the row, flipping above when that fits, pinned 8px inside the window and scrolling when taller), follows window
+  resizes, and closes when a resize or phone rotation hides the sidebar instead of floating over the composer. Thanks @ybai08. (#8052,
+  fixes #8044)
 - **Codex sign-in sends an explicit User-Agent on its device-code requests**, so the OAuth endpoint no longer
   sees a bare library default. Thanks @angelusbr. (#8118)
 
