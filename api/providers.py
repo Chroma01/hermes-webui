@@ -1583,9 +1583,19 @@ def _usage_api_reset_at(value: Any) -> str | None:
 
 
 def _usage_api_status_detail(value: Any) -> str | None:
-    """A short status word ("ok", "rate_limited") from an untrusted usage API, or None."""
+    """A short status word from an untrusted usage API, humanized ("rate_limited" ->
+    "Rate limited"), or None. A healthy "ok" is not worth a line on the card."""
     text = value.strip() if isinstance(value, str) else ""
-    return text if _QUOTA_STATUS_RE.fullmatch(text) else None
+    if not _QUOTA_STATUS_RE.fullmatch(text) or text.lower() == "ok":
+        return None
+    return text.replace("_", " ").strip().capitalize() or None
+
+
+def _quota_money(value: int | float) -> str | None:
+    """"$12.50", or None for an amount too large to be a balance: a finite 1e308 would
+    otherwise print hundreds of digits into the card."""
+    amount = float(value)
+    return f"${amount:.2f}" if abs(amount) < 1e12 else None
 
 
 def _quota_window(payload: Any, label: str) -> dict[str, Any] | None:
@@ -1596,12 +1606,13 @@ def _quota_window(payload: Any, label: str) -> dict[str, Any] | None:
     if used is None or limit is None or float(used) < 0 or float(limit) <= 0:
         return None
     used_percent = max(0.0, min(100.0, float(used) / float(limit) * 100.0))
+    used_money, limit_money = _quota_money(used), _quota_money(limit)
     return {
         "label": label,
         "used_percent": used_percent,
         "remaining_percent": 100.0 - used_percent,
         "reset_at": _usage_api_reset_at(payload.get("reset_at", payload.get("resetAt"))),
-        "detail": f"${float(used):g} used of ${float(limit):g}",
+        "detail": f"{used_money} used of {limit_money}" if used_money and limit_money else None,
     }
 
 
@@ -1611,7 +1622,8 @@ def _sanitize_opencode_go_quota(payload: Any) -> dict[str, Any] | None:
     quota = payload.get("quota", payload.get("data", payload.get("usage", payload)))
     if not isinstance(quota, dict):
         return None
-    specs = (("rolling", "Rolling"), ("weekly", "Weekly"), ("monthly", "Monthly"))
+    # OpenCode documents the rolling window as five hours.
+    specs = (("rolling", "5-hour"), ("weekly", "Weekly"), ("monthly", "Monthly"))
     windows = []
     for key, label in specs:
         raw = quota.get(key)
@@ -1631,7 +1643,8 @@ def _sanitize_opencode_go_quota(payload: Any) -> dict[str, Any] | None:
         return None
     return {
         "provider": "opencode-go", "source": "usage_api",
-        "title": "OpenCode Go limits", "plan": "OpenCode Go",
+        # Neither usage API reports a plan tier; the card already names the provider.
+        "title": "OpenCode Go limits", "plan": None,
         "windows": windows, "details": [], "available": True,
         "unavailable_reason": None, "fetched_at": None,
     }
@@ -1648,15 +1661,19 @@ def _sanitize_commandcode_quota(payload: Any) -> dict[str, Any] | None:
     if not windows:
         return None
     credits = payload.get("credits") if isinstance(payload.get("credits"), dict) else {}
-    remaining = sum(
-        max(0.0, float(_quota_number(credits.get(key)) or 0))
-        for key in ("monthlyCredits", "purchasedCredits", "freeCredits")
-    )
+    # No credit field at all is an unknown balance, not a zero one.
+    balances = [
+        number for number in (
+            _quota_number(credits.get(key)) for key in ("monthlyCredits", "purchasedCredits", "freeCredits")
+        ) if number is not None
+    ]
+    remaining = sum(max(0.0, float(number)) for number in balances)
     # Each credit field is finite, but their sum can still overflow to inf.
-    details = [f"Credits remaining: ${remaining:g}"] if math.isfinite(remaining) else []
+    remaining_money = _quota_money(remaining) if balances else None
+    details = [f"Credits remaining: {remaining_money}"] if remaining_money else []
     return {
         "provider": "commandcode", "source": "usage_api",
-        "title": "CommandCode limits", "plan": "CommandCode",
+        "title": "CommandCode limits", "plan": None,
         "windows": windows, "details": details,
         "available": True, "unavailable_reason": None, "fetched_at": None,
     }
@@ -2428,12 +2445,20 @@ def get_provider_quota(provider_id: str | None = None, *, refresh: bool = False)
                     "message": f"{display_name} account limits loaded.",
                 }
         if definitive or local_snapshot is None:
+            if status == "invalid_key":
+                # The key can come from .env, an alias variable or config.yaml, so point
+                # at the one place that edits it rather than name a variable.
+                message = f"{display_name} rejected the configured API key. Update it in Settings → Providers."
+            elif definitive:
+                message = f"{display_name} returned no usable quota windows."
+            else:
+                message = f"{display_name} quota status is temporarily unavailable."
             return {
                 "ok": False, "provider": provider, "display_name": display_name,
                 "supported": True, "status": status, "quota": None,
                 # The pool breakdown, when there is one, stays next to the failure.
                 "account_limits": pool_limits,
-                "message": f"{display_name} rejected the configured API key." if status == "invalid_key" else f"{display_name} quota status is temporarily unavailable.",
+                "message": message,
             }
 
     if local_snapshot is not None:

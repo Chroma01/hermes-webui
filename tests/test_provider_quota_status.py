@@ -203,7 +203,7 @@ def test_commandcode_quota_exposes_sanitized_windows(monkeypatch, tmp_path):
 
     assert result["status"] == "available"
     assert [w["remaining_percent"] for w in result["account_limits"]["windows"]] == [75.0, 60.0]
-    assert result["account_limits"]["details"] == ["Credits remaining: $10"]
+    assert result["account_limits"]["details"] == ["Credits remaining: $10.00"]
     assert "private-commandcode-key" not in repr(result)
     assert "secret" not in repr(result)
 
@@ -327,7 +327,7 @@ def test_commandcode_quota_drops_non_finite_window_numbers(monkeypatch, tmp_path
     assert result["status"] == "available"
     windows = result["account_limits"]["windows"]
     assert [w["label"] for w in windows] == ["Weekly"]
-    assert result["account_limits"]["details"] == ["Credits remaining: $2"]
+    assert result["account_limits"]["details"] == ["Credits remaining: $2.00"]
     _assert_strict_json_safe(result)
 
 
@@ -524,6 +524,34 @@ def test_usage_api_quota_definitive_failure_is_reported_next_to_the_pool(monkeyp
     assert "private-usage-key" not in repr(result)
 
 
+@pytest.mark.parametrize("provider", sorted(_USAGE_API_KEYS))
+@pytest.mark.parametrize("pool", [None, "pooled"])
+@pytest.mark.parametrize(
+    "urlopen, expected",
+    [
+        (lambda: _raiser(_http_error(401)), "rejected the configured API key. Update it in Settings"),
+        (lambda: _respond(b'{"usage": {"weekly": {"percent": "NaN"}}, "windowLimits": {"weekly": {"used": -1, "cap": 30}}}'), "returned no usable quota windows."),
+    ],
+    ids=["401", "all-windows-invalid"],
+)
+def test_usage_api_quota_definitive_failure_message_says_what_happened(monkeypatch, tmp_path, provider, pool, urlopen, expected):
+    result = _usage_api_quota(
+        monkeypatch, tmp_path, provider, urlopen(), pool=_pool_snapshot("available") if pool else None,
+    )
+
+    assert expected in result["message"]
+    assert "temporarily unavailable" not in result["message"]
+    assert "private-usage-key" not in repr(result)
+
+
+@pytest.mark.parametrize("provider", sorted(_USAGE_API_KEYS))
+def test_usage_api_quota_transient_failure_without_a_pool_stays_temporarily_unavailable(monkeypatch, tmp_path, provider):
+    result = _usage_api_quota(monkeypatch, tmp_path, provider, _raiser(_http_error(500)))
+
+    assert result["status"] == "unavailable"
+    assert result["message"].endswith("quota status is temporarily unavailable.")
+
+
 def _install_env_seeding_agent_pool(monkeypatch, provider):
     """Stand in for the Agent's credential pool, which seeds one entry from the provider env key.
 
@@ -667,13 +695,86 @@ def test_usage_api_quota_does_not_echo_free_text_from_the_response(monkeypatch, 
     assert "private-usage-key" not in repr(result)
 
 
-def test_usage_api_quota_keeps_status_words_and_iso_reset_times(monkeypatch, tmp_path):
+def test_usage_api_quota_humanizes_status_words_and_keeps_iso_reset_times(monkeypatch, tmp_path):
     body = {"usage": {"weekly": {"percent": 30, "status": "rate_limited", "resetsAt": "2030-03-24T12:30:00Z"}}}
     result = _usage_api_quota(monkeypatch, tmp_path, "opencode-go", _respond(json.dumps(body)))
 
     (window,) = result["account_limits"]["windows"]
-    assert window["detail"] == "rate_limited"
+    assert window["detail"] == "Rate limited"
     assert window["reset_at"] == "2030-03-24T12:30:00Z"
+
+
+@pytest.mark.parametrize("status", ["ok", "OK", " Ok "])
+def test_opencode_go_quota_hides_a_healthy_status_word(monkeypatch, tmp_path, status):
+    body = {"usage": {"weekly": {"percent": 30, "status": status}}}
+    result = _usage_api_quota(monkeypatch, tmp_path, "opencode-go", _respond(json.dumps(body)))
+
+    (window,) = result["account_limits"]["windows"]
+    assert window["detail"] is None
+
+
+def test_opencode_go_quota_labels_the_rolling_window_with_its_duration(monkeypatch, tmp_path):
+    body = {"usage": {key: {"percent": 10} for key in ("rolling", "weekly", "monthly")}}
+    result = _usage_api_quota(monkeypatch, tmp_path, "opencode-go", _respond(json.dumps(body)))
+
+    assert [w["label"] for w in result["account_limits"]["windows"]] == ["5-hour", "Weekly", "Monthly"]
+
+
+@pytest.mark.parametrize("provider", sorted(_USAGE_API_BODIES))
+def test_usage_api_quota_reports_no_plan_so_the_card_subtitle_is_the_provider_once(monkeypatch, tmp_path, provider):
+    result = _usage_api_quota(monkeypatch, tmp_path, provider, _respond(_USAGE_API_BODIES[provider]))
+
+    assert result["status"] == "available"
+    assert result["account_limits"]["plan"] is None
+
+
+def test_commandcode_quota_formats_money_with_two_decimals(monkeypatch, tmp_path):
+    body = json.dumps({
+        "credits": {"monthlyCredits": 1234567.5},
+        "windowLimits": {"weekly": {"used": 3.5, "cap": 12.5}},
+    })
+    result = _usage_api_quota(monkeypatch, tmp_path, "commandcode", _respond(body))
+
+    (window,) = result["account_limits"]["windows"]
+    assert window["detail"] == "$3.50 used of $12.50"
+    assert result["account_limits"]["details"] == ["Credits remaining: $1234567.50"]
+
+
+@pytest.mark.parametrize("credits", [None, {}, {"monthlyCredits": None}, {"monthlyCredits": "n/a"}, "none"])
+def test_commandcode_quota_omits_an_unknown_credit_balance(monkeypatch, tmp_path, credits):
+    body = {"windowLimits": {"weekly": {"used": 12, "cap": 30}}}
+    if credits is not None:
+        body["credits"] = credits
+    result = _usage_api_quota(monkeypatch, tmp_path, "commandcode", _respond(json.dumps(body)))
+
+    assert result["status"] == "available"
+    assert result["account_limits"]["details"] == []
+
+
+def test_commandcode_quota_does_not_print_absurdly_large_amounts(monkeypatch, tmp_path):
+    body = '{"credits": {"monthlyCredits": 1e308}, "windowLimits": {"weekly": {"used": 1e300, "cap": 1e308}}}'
+    result = _usage_api_quota(monkeypatch, tmp_path, "commandcode", _respond(body))
+
+    (window,) = result["account_limits"]["windows"]
+    assert window["detail"] is None
+    assert result["account_limits"]["details"] == []
+    assert len(json.dumps(result)) < 2000
+
+
+def test_commandcode_quota_reports_a_real_zero_credit_balance(monkeypatch, tmp_path):
+    body = {"credits": {"monthlyCredits": 0}, "windowLimits": {"weekly": {"used": 12, "cap": 30}}}
+    result = _usage_api_quota(monkeypatch, tmp_path, "commandcode", _respond(json.dumps(body)))
+
+    assert result["account_limits"]["details"] == ["Credits remaining: $0.00"]
+
+
+def test_quota_card_failure_message_is_coloured_by_state_and_takes_its_own_row():
+    css = (ROOT / "static" / "style.css").read_text(encoding="utf-8")
+    # Scoped to the card body: the cost chart's empty state reuses the class and is not a failure.
+    assert ".provider-quota-card-invalid_key .provider-quota-body>.provider-quota-message{color:var(--error);}" in css
+    assert ".provider-quota-card-unavailable .provider-quota-body>.provider-quota-message{color:var(--warning);}" in css
+    assert not re.search(r"provider-quota-card-\w+ \.provider-quota-message\{", css)
+    assert ".provider-quota-body>.provider-quota-message{width:100%;}" in css
 
 
 def test_quota_card_shows_the_failure_message_above_a_pool_breakdown():
