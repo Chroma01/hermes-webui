@@ -515,6 +515,79 @@ def _remote_gateway_base_url() -> str | None:
     return None
 
 
+# Gateway lifecycle capability (#8391)
+# ------------------------------------------------------------------
+# The status path above can monitor a Gateway WebUI does not run (an explicit
+# remote health URL), while every lifecycle entrypoint (Settings Start/Stop/
+# Restart, the health-banner restart, the Agent-update restart) drives the LOCAL
+# ``hermes gateway`` CLI for the active profile. Pairing the two let WebUI offer
+# to start a local Gateway next to a healthy remote one, or "restart" a remote
+# Gateway by restarting an unrelated local process. This is the one
+# server-owned answer to "does the local CLI control the Gateway WebUI is
+# monitoring?"; the UI and every lifecycle caller read it instead of inferring
+# ownership from status or from the chat-backend selection.
+
+GATEWAY_EXTERNALLY_MANAGED_MESSAGE = (
+    "This Gateway is managed outside WebUI. Start, stop, or restart it where it runs."
+)
+
+
+def _is_loopback_base_url(base_url: str) -> bool:
+    """Return True only for an http(s) URL whose host is a loopback literal.
+
+    Hostname matching is exact (``localhost`` or a loopback IP), so look-alike
+    names such as ``127.0.0.1.example.com`` or ``localhost.example.com`` are not
+    treated as local, and no DNS resolution happens on this path.
+    """
+    import ipaddress
+    from urllib.parse import urlsplit
+
+    try:
+        parts = urlsplit(base_url)
+    except ValueError:
+        return False
+    if parts.scheme.lower() not in {"http", "https"}:
+        return False
+    host = (parts.hostname or "").strip().lower()
+    if not host:
+        return False
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def gateway_lifecycle_capability(profile: str | None = None) -> dict[str, Any]:
+    """Return whether WebUI's local CLI controls the Gateway it monitors.
+
+    ``{"managed": bool, "reason": str}``:
+
+    * No remote Gateway URL configured: status comes from this host's
+      active-profile Gateway files, which is exactly what ``hermes gateway
+      start|stop|restart`` targets -> managed (``local_gateway``).
+    * A remote URL on a loopback host AND a confirmed, running Gateway process
+      for the target profile on this host -> managed (``local_gateway``). A
+      loopback URL alone is not proof: Docker port maps and SSH tunnels also
+      answer on 127.0.0.1.
+    * Anything else with a remote URL -> not managed (``external_gateway``).
+
+    Fail-closed: any error while proving local ownership reports unmanaged.
+    """
+    remote_base = _remote_gateway_base_url()
+    if remote_base is None:
+        return {"managed": True, "reason": "local_gateway"}
+    try:
+        if _is_loopback_base_url(remote_base) and (
+            get_active_profile_gateway_running_pid(profile=profile) is not None
+        ):
+            return {"managed": True, "reason": "local_gateway"}
+    except Exception:
+        pass
+    return {"managed": False, "reason": "external_gateway"}
+
+
 def _remote_gateway_api_key() -> str:
     """Return the Bearer token for authenticated gateway health probes.
 
