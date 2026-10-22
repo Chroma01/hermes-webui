@@ -46,9 +46,20 @@ _REMOTE_ENV_VARS = (
 
 
 @pytest.fixture(autouse=True)
-def _clean_gateway_env(monkeypatch):
+def _clean_gateway_env(monkeypatch, tmp_path):
+    from api import agent_health
+
     for var in _REMOTE_ENV_VARS:
         monkeypatch.delenv(var, raising=False)
+    # Each test gets its own persisted-ownership record so a proof recorded by
+    # one test can never authorize another.
+    ownership_path = tmp_path / "webui-state" / "gateway_lifecycle_ownership.json"
+    monkeypatch.setattr(
+        agent_health,
+        "_gateway_ownership_record_path",
+        lambda: ownership_path,
+        raising=False,
+    )
     yield
 
 
@@ -524,6 +535,337 @@ def test_agent_update_real_helper_makes_zero_subprocess_calls_for_external_gatew
 
     assert ok is True
     assert result["status"] == "external"
+
+
+# ── persisted local ownership: Stop / crash / failed restart keep control ─
+#
+# Codex r1 (CORE): with a loopback URL, ownership used to be proven only by a
+# live PID, so Stop (or a restart whose replacement failed to launch) made the
+# capability false and Start / the restart retry returned 409. Once a running
+# Gateway for this profile home has been observed behind this exact loopback
+# endpoint, that ownership persists (WebUI state dir) through Stop, crashes,
+# failed restarts and WebUI restarts, scoped to profile home + endpoint.
+
+
+class _PidSwitch:
+    """Stand-in for get_active_profile_gateway_running_pid with a mutable PID."""
+
+    def __init__(self, pid=None):
+        self.pid = pid
+        self.calls = []
+
+    def __call__(self, profile=None):
+        self.calls.append(profile)
+        return self.pid
+
+
+def _pid_switch(monkeypatch, pid=None):
+    from api import agent_health
+
+    switch = _PidSwitch(pid)
+    monkeypatch.setattr(agent_health, "get_active_profile_gateway_running_pid", switch)
+    return switch
+
+
+def _pin_profile_homes(monkeypatch, active_home, homes_by_name=None):
+    from api import profiles
+
+    homes_by_name = dict(homes_by_name or {})
+    monkeypatch.setattr(profiles, "get_active_hermes_home", lambda: active_home)
+    monkeypatch.setattr(
+        profiles,
+        "get_hermes_home_for_profile",
+        lambda name: homes_by_name.get(name, active_home),
+    )
+
+
+def _managed():
+    return {"managed": True, "reason": "local_gateway"}
+
+
+def _external():
+    return {"managed": False, "reason": "external_gateway"}
+
+
+def test_loopback_gateway_stopped_by_webui_can_be_started_again(monkeypatch, tmp_path):
+    from api import agent_health, config, profiles, routes
+
+    agent_dir = _fake_agent(tmp_path)
+    monkeypatch.setattr(config, "_AGENT_DIR", agent_dir)
+    monkeypatch.setattr(config, "PYTHON_EXE", sys.executable)
+    monkeypatch.setattr(profiles, "get_active_profile_name", lambda: "default")
+    _pin_profile_homes(monkeypatch, tmp_path / "home")
+    # The documented gateway-chat configuration.
+    monkeypatch.setenv("HERMES_WEBUI_GATEWAY_BASE_URL", "http://127.0.0.1:8642")
+    pid = _pid_switch(monkeypatch, 4242)
+    monkeypatch.setattr(
+        routes,
+        "build_agent_health_payload",
+        lambda: {"alive": pid.pid is not None, "details": {}},
+    )
+    actions = []
+
+    def fake_run(cmd, **kw):
+        actions.append(cmd[-1])
+        pid.pid = None if cmd[-1] == "stop" else 5151
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(routes.subprocess, "run", fake_run)
+
+    handler, data = _call_post(monkeypatch, "/api/gateway/stop", {})
+    assert handler.status == 200, data
+    # Stopped now: the refreshed status still offers lifecycle actions.
+    assert data["status"]["lifecycle"] == _managed()
+    assert agent_health.gateway_lifecycle_capability() == _managed()
+
+    handler, data = _call_post(monkeypatch, "/api/gateway/start", {})
+    assert handler.status == 200, data
+    assert data["ok"] is True
+    assert actions == ["stop", "start"]
+
+
+def test_loopback_ownership_survives_crash_and_is_persisted_on_disk(monkeypatch, tmp_path):
+    from api import agent_health
+
+    home = tmp_path / "home"
+    _pin_profile_homes(monkeypatch, home)
+    monkeypatch.setenv("HERMES_API_URL", "http://localhost:8642/health")
+    pid = _pid_switch(monkeypatch, 4242)
+
+    assert agent_health.gateway_lifecycle_capability() == _managed()
+    pid.pid = None  # the Gateway crashed / was stopped outside the Settings card
+    assert agent_health.gateway_lifecycle_capability() == _managed()
+
+    # The proof lives on disk (survives a WebUI restart), scoped to the
+    # resolved profile home and the exact monitored endpoint.
+    record = json.loads(agent_health._gateway_ownership_record_path().read_text(encoding="utf-8"))
+    owners = record["owners"]
+    assert list(owners) == [str(home.resolve())]
+    assert owners[str(home.resolve())]["endpoint"] == "http://localhost:8642"
+
+
+def test_health_restart_can_be_retried_after_replacement_failed(monkeypatch, tmp_path):
+    import api.gateway_restart as gateway_restart
+
+    gateway_restart._GATEWAY_RESTART_LOCK = threading.Lock()
+    home = tmp_path / "home"
+    _pin_profile_homes(monkeypatch, home)
+    monkeypatch.setattr(gateway_restart, "get_active_hermes_home", lambda: home)
+    monkeypatch.setattr(gateway_restart, "get_active_profile_name", lambda: "default")
+    monkeypatch.setattr(gateway_restart.shutil, "which", lambda cmd: "/mock/bin/hermes")
+    monkeypatch.setenv("HERMES_WEBUI_GATEWAY_BASE_URL", "http://127.0.0.1:8642")
+    pid = _pid_switch(monkeypatch, 4242)
+    launches = []
+
+    class _Proc:
+        def __init__(self, returncode):
+            self.returncode = returncode
+
+        def communicate(self, timeout=None):
+            return "", ("replacement failed to launch" if self.returncode else "")
+
+    def fake_popen(args, **kw):
+        launches.append(args)
+        if len(launches) == 1:
+            pid.pid = None  # old Gateway stopped; its replacement never came up
+            return _Proc(1)
+        pid.pid = 5151
+        return _Proc(0)
+
+    monkeypatch.setattr(gateway_restart.subprocess, "Popen", fake_popen)
+
+    first = gateway_restart.restart_active_profile_gateway()
+    retry = gateway_restart.restart_active_profile_gateway()
+
+    assert first["status"] == "failed"
+    assert retry["status"] == "completed", retry
+    assert len(launches) == 2
+
+
+def test_agent_update_retry_recovers_loopback_gateway_after_failed_replacement(monkeypatch, tmp_path):
+    import api.gateway_restart as gateway_restart
+    import api.updates as upd
+
+    gateway_restart._GATEWAY_RESTART_LOCK = threading.Lock()
+    home = tmp_path / "home"
+    _pin_profile_homes(monkeypatch, home, {"default": home})
+    monkeypatch.setattr(gateway_restart, "get_hermes_home_for_profile", lambda name: home)
+    monkeypatch.setattr(gateway_restart.shutil, "which", lambda cmd: "/mock/bin/hermes")
+    monkeypatch.setattr(upd, "get_active_profile_name", lambda: "default")
+    monkeypatch.setattr(upd.time, "sleep", lambda s: None)
+    monkeypatch.setenv("HERMES_WEBUI_GATEWAY_BASE_URL", "http://127.0.0.1:8642")
+    pid = _pid_switch(monkeypatch, 4242)
+    monkeypatch.setattr(upd, "get_active_profile_gateway_running_pid", pid)
+    launches = []
+
+    class _Proc:
+        def __init__(self, returncode):
+            self.returncode = returncode
+
+        def communicate(self, timeout=None):
+            return "", ("replacement failed to launch" if self.returncode else "")
+
+    def fake_popen(args, **kw):
+        launches.append(args)
+        if len(launches) == 1:
+            pid.pid = None
+            return _Proc(1)
+        pid.pid = 5151
+        return _Proc(0)
+
+    monkeypatch.setattr(gateway_restart.subprocess, "Popen", fake_popen)
+
+    ok, result = upd._ensure_gateway_restart_for_agent_update()
+
+    assert ok is True, result
+    assert result["status"] == "completed"
+    assert result["retry_attempted"] is True
+    assert len(launches) == 2
+
+
+def test_loopback_gateway_never_seen_running_stays_read_only(monkeypatch, tmp_path):
+    """No proof yet (stopped, never observed running behind this endpoint):
+    a loopback URL alone may be a Docker port map or SSH tunnel -> 409."""
+    from api import routes
+
+    _pin_profile_homes(monkeypatch, tmp_path / "home")
+    monkeypatch.setenv("HERMES_WEBUI_GATEWAY_BASE_URL", "http://127.0.0.1:8642")
+    _pid_switch(monkeypatch, None)
+    spawned = []
+    monkeypatch.setattr(routes.subprocess, "run", lambda cmd, **kw: spawned.append(cmd))
+
+    handler, data = _call_post(monkeypatch, "/api/gateway/start", {})
+
+    assert handler.status == 409
+    assert data["code"] == "gateway_externally_managed"
+    assert spawned == []
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://gateway.internal:8642",
+        "http://10.0.0.5:8642",
+        "http://192.168.1.20:8642",
+        "http://127.0.0.1.evil.example:8642",
+        "http://localhost.evil.example:8642",
+        "127.0.0.1:8642",
+        "ftp://127.0.0.1:8642",
+    ],
+)
+@pytest.mark.parametrize("pid_alive", [True, False])
+def test_persisted_loopback_proof_never_authorizes_remote_lan_or_lookalike(
+    monkeypatch, tmp_path, url, pid_alive
+):
+    from api import agent_health, routes
+
+    _pin_profile_homes(monkeypatch, tmp_path / "home")
+    monkeypatch.setenv("HERMES_WEBUI_GATEWAY_BASE_URL", "http://127.0.0.1:8642")
+    pid = _pid_switch(monkeypatch, 4242)
+    assert agent_health.gateway_lifecycle_capability() == _managed()  # proof recorded
+
+    monkeypatch.setenv("HERMES_WEBUI_GATEWAY_BASE_URL", url)
+    pid.pid = 4242 if pid_alive else None
+    spawned = []
+    monkeypatch.setattr(routes.subprocess, "run", lambda cmd, **kw: spawned.append(cmd))
+
+    assert agent_health.gateway_lifecycle_capability() == _external()
+    handler, data = _call_post(monkeypatch, "/api/gateway/start", {})
+    assert handler.status == 409
+    assert data["code"] == "gateway_externally_managed"
+    assert spawned == []
+
+
+def test_persisted_proof_is_scoped_to_the_exact_loopback_endpoint(monkeypatch, tmp_path):
+    from api import agent_health
+
+    _pin_profile_homes(monkeypatch, tmp_path / "home")
+    monkeypatch.setenv("HERMES_API_URL", "http://127.0.0.1:8642")
+    pid = _pid_switch(monkeypatch, 4242)
+    assert agent_health.gateway_lifecycle_capability() == _managed()
+    pid.pid = None
+
+    # Another loopback port (e.g. a Docker port map or SSH tunnel) is a
+    # different target: the proof does not transfer, and the target change
+    # invalidates it -- going back requires a fresh proof.
+    monkeypatch.setenv("HERMES_API_URL", "http://127.0.0.1:9642")
+    assert agent_health.gateway_lifecycle_capability() == _external()
+    monkeypatch.setenv("HERMES_API_URL", "http://127.0.0.1:8642")
+    assert agent_health.gateway_lifecycle_capability() == _external()
+
+
+def test_persisted_proof_is_scoped_to_the_profile_home(monkeypatch, tmp_path):
+    from api import agent_health
+
+    home_a = tmp_path / "profiles" / "alpha"
+    home_b = tmp_path / "profiles" / "beta"
+    monkeypatch.setenv("HERMES_API_URL", "http://127.0.0.1:8642")
+    pid = _pid_switch(monkeypatch, 4242)
+    _pin_profile_homes(monkeypatch, home_a, {"alpha": home_a, "beta": home_b})
+    assert agent_health.gateway_lifecycle_capability() == _managed()
+    pid.pid = None
+
+    assert agent_health.gateway_lifecycle_capability() == _managed()
+    assert agent_health.gateway_lifecycle_capability(profile="alpha") == _managed()
+    # Same endpoint, different profile home: never proven -> external.
+    assert agent_health.gateway_lifecycle_capability(profile="beta") == _external()
+    _pin_profile_homes(monkeypatch, home_b, {"alpha": home_a, "beta": home_b})
+    assert agent_health.gateway_lifecycle_capability() == _external()
+
+
+@pytest.mark.parametrize("payload", ["{not json", "[]", '{"owners": []}', '{"owners": {"x": 1}}'])
+def test_unreadable_ownership_record_fails_closed(monkeypatch, tmp_path, payload):
+    from api import agent_health
+
+    _pin_profile_homes(monkeypatch, tmp_path / "home")
+    monkeypatch.setenv("HERMES_API_URL", "http://127.0.0.1:8642")
+    _pid_switch(monkeypatch, None)
+    path = agent_health._gateway_ownership_record_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(payload, encoding="utf-8")
+
+    assert agent_health.gateway_lifecycle_capability() == _external()
+
+
+def test_ownership_record_never_stores_url_credentials(monkeypatch, tmp_path):
+    from api import agent_health
+
+    _pin_profile_homes(monkeypatch, tmp_path / "home")
+    monkeypatch.setenv("HERMES_API_URL", "http://alice:s3cret@127.0.0.1:8642?token=abc")
+    pid = _pid_switch(monkeypatch, 4242)
+    assert agent_health.gateway_lifecycle_capability() == _managed()
+    pid.pid = None
+    assert agent_health.gateway_lifecycle_capability() == _managed()
+
+    text = agent_health._gateway_ownership_record_path().read_text(encoding="utf-8")
+    assert "s3cret" not in text and "alice" not in text and "token" not in text
+
+
+def test_unwritable_ownership_record_keeps_live_proof_and_fails_closed_after(monkeypatch, tmp_path):
+    from api import agent_health
+
+    _pin_profile_homes(monkeypatch, tmp_path / "home")
+    blocker = tmp_path / "not-a-dir"
+    blocker.write_text("x", encoding="utf-8")
+    monkeypatch.setattr(
+        agent_health, "_gateway_ownership_record_path", lambda: blocker / "ownership.json"
+    )
+    monkeypatch.setenv("HERMES_API_URL", "http://127.0.0.1:8642")
+    pid = _pid_switch(monkeypatch, 4242)
+
+    assert agent_health.gateway_lifecycle_capability() == _managed()
+    pid.pid = None
+    assert agent_health.gateway_lifecycle_capability() == _external()
+
+
+def test_local_only_setup_never_reads_or_writes_ownership_record(monkeypatch, tmp_path):
+    from api import agent_health
+
+    _pin_profile_homes(monkeypatch, tmp_path / "home")
+    _pid_switch(monkeypatch, None)
+
+    assert agent_health.gateway_lifecycle_capability() == _managed()
+    assert not agent_health._gateway_ownership_record_path().exists()
 
 
 # ── frontend ──────────────────────────────────────────────────────────────
