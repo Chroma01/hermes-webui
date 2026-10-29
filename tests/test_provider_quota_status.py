@@ -791,13 +791,16 @@ def test_quota_card_unavailable_badge_matches_its_warning_message():
     """Fable UX gate r2 (2026-10-06): the unavailable card coloured its message but its badge
     fell back to the accent gold; it now shares the warning badge rule with no_key/unsupported."""
     css = (ROOT / "static" / "style.css").read_text(encoding="utf-8")
-    rules = re.findall(r"([^{}]*)\{background:rgba\(234,179,8,\.12\);color:var\(--warning\);\}", css)
+    rules = re.findall(r"([^{}]*)\{background:rgba\(234,179,8,\.12\);color:color-mix\(in srgb,var\(--warning\) 55%,var\(--text\)\);\}", css)
     badge_rules = [{s.strip() for s in group.split(",")} for group in rules
                    if ".provider-quota-card-no_key .provider-quota-badge" in group]
     assert len(badge_rules) == 1, "warning badge rule missing or duplicated"
     selectors = badge_rules[0]
     assert ".provider-quota-card-unavailable .provider-quota-badge" in selectors
     assert ".provider-quota-card-unsupported .provider-quota-badge" in selectors
+    # Release gate (2026-10-29): pure --warning on the 12% pill measured 2.37:1 on the default light
+    # theme (master's accent-text badge was 5.17:1), so the badge uses the message's mixed hue.
+    assert not re.search(r"provider-quota-badge\{[^}]*color:var\(--warning\)", css)
 
 
 def test_quota_card_shows_the_failure_message_above_a_pool_breakdown():
