@@ -801,6 +801,8 @@ def test_quota_card_unavailable_badge_matches_its_warning_message():
     # Release gate (2026-10-29): pure --warning on the 12% pill measured 2.37:1 on the default light
     # theme (master's accent-text badge was 5.17:1), so the badge uses the message's mixed hue.
     assert not re.search(r"provider-quota-badge\{[^}]*color:var\(--warning\)", css)
+    # The pool row's Exhausted pill sits on the same card and the same 12% amber (2.13:1 measured).
+    assert not re.search(r"provider-quota-pool-row-exhausted [^{]*\{[^}]*color:var\(--warning\)", css)
 
 
 def test_quota_card_shows_the_failure_message_above_a_pool_breakdown():
