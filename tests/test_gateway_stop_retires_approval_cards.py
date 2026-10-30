@@ -573,6 +573,56 @@ def test_card_parsed_while_stop_lands_is_not_published(gateway_env, monkeypatch,
         turn.finish()
 
 
+@GATEWAYS
+def test_card_cannot_be_published_after_stop_returned(gateway_env, monkeypatch, payload):
+    # The worker passed its pre-publish cancel check, then Stop ran to
+    # completion (its settle found nothing to retire) before the worker inserted
+    # the card. The insertion itself must see the cancel flag under the
+    # registry lock, so no card for the stopped run ever becomes clickable,
+    # not even for the moment before the worker's post-publish recheck.
+    # (Codex release gate #8634, reproduced natively with the installed Agent.)
+    gateway = _FakeGateway(monkeypatch, payload)
+    turn = _DefaultStreamTurn(gateway, "stream-publish-after-stop")
+    before_publish = threading.Event()
+    publish_allowed = threading.Event()
+    after_publish = threading.Event()
+    worker_allowed = threading.Event()
+    real_submit = approvals.submit_gateway_pending_mirror
+
+    def delayed_submit(*args, **kwargs):
+        before_publish.set()
+        assert publish_allowed.wait(WAIT)
+        answer = real_submit(*args, **kwargs)
+        after_publish.set()
+        # Hold the worker before its own post-publish recheck.
+        assert worker_allowed.wait(WAIT)
+        return answer
+
+    monkeypatch.setattr(approvals, "submit_gateway_pending_mirror", delayed_submit)
+    turn.thread.start()
+    try:
+        assert before_publish.wait(WAIT)
+        assert streaming.cancel_stream(turn.stream_id) is True
+        assert approvals.gateway_pending_mirror(turn.session_id) is None
+        publish_allowed.set()
+        assert after_publish.wait(WAIT)
+        assert approvals.gateway_pending_mirror(turn.session_id) is None, (
+            "the worker published a card after Stop had returned"
+        )
+        card = {
+            "approval_id": payload.get("request_id") or payload.get("approval_id"),
+            "run_id": RUN_ID,
+            "_gateway_mirror_token": "any",
+        }
+        status, answer = turn.click(card=card)
+        assert status == 409 and answer["code"] == "gateway_run_unavailable", (status, answer)
+        assert gateway.posts == []
+    finally:
+        publish_allowed.set()
+        worker_allowed.set()
+        turn.finish()
+
+
 # ---------------------------------------------------------------------------
 # (e) local (non-Gateway) approvals are unaffected
 # ---------------------------------------------------------------------------
