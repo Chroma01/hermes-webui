@@ -14277,7 +14277,7 @@ function _gatewayLocalUnprovenNoteHtml(lifecycle){
   // escaped text are added after esc(), so the note stays XSS-safe.
   const raw=lifecycle&&lifecycle.start_command;
   const command=(typeof raw==='string'&&raw.trim())?raw:'hermes gateway start';
-  const codeStyle='font-family:var(--font-mono,monospace);font-size:11px;background:var(--code-bg);padding:1px 5px;border-radius:4px;white-space:nowrap';
+  const codeStyle='font-family:var(--font-mono,monospace);font-size:11px;background:var(--code-bg);padding:1px 5px;border-radius:4px;white-space:pre-wrap;overflow-wrap:anywhere;-webkit-box-decoration-break:clone;box-decoration-break:clone';
   return esc(t('gateway_local_unproven')).split('{cmd}').join(`<code style="${codeStyle}">${esc(command)}</code>`);
 }
 function _gatewayActionControls(r){
