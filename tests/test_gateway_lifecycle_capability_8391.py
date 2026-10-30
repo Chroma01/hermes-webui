@@ -16,8 +16,10 @@ Gateway it is monitoring. These tests pin:
   every status branch of an external Gateway;
 * a loopback Gateway with no ownership proof yet reporting its own reason
   (``local_gateway_unproven``, still unmanaged everywhere) so the Settings card
-  can tell a stopped Gateway of this machine to start once with
-  ``hermes gateway start`` (follow-up D).
+  can tell a stopped Gateway of this machine to start once with the exact CLI
+  command for the target profile (``start_command``: ``hermes gateway start``,
+  or ``hermes --profile <name> gateway start`` for a named profile, the same
+  rule the Settings Start button uses) (follow-up D).
 """
 
 from __future__ import annotations
@@ -574,11 +576,14 @@ def _pid_switch(monkeypatch, pid=None):
     return switch
 
 
-def _pin_profile_homes(monkeypatch, active_home, homes_by_name=None):
+def _pin_profile_homes(monkeypatch, active_home, homes_by_name=None, active_name="default"):
     from api import profiles
 
     homes_by_name = dict(homes_by_name or {})
     monkeypatch.setattr(profiles, "get_active_hermes_home", lambda: active_home)
+    # The same accessor routes._run_gateway_lifecycle_command reads; it also
+    # picks the start_command an unproven result carries.
+    monkeypatch.setattr(profiles, "get_active_profile_name", lambda: active_name)
     monkeypatch.setattr(
         profiles,
         "get_hermes_home_for_profile",
@@ -594,8 +599,8 @@ def _external():
     return {"managed": False, "reason": "external_gateway"}
 
 
-def _unproven():
-    return {"managed": False, "reason": "local_gateway_unproven"}
+def _unproven(start_command="hermes gateway start"):
+    return {"managed": False, "reason": "local_gateway_unproven", "start_command": start_command}
 
 
 def test_loopback_gateway_stopped_by_webui_can_be_started_again(monkeypatch, tmp_path):
@@ -820,8 +825,11 @@ def test_persisted_proof_is_scoped_to_the_profile_home(monkeypatch, tmp_path):
 
     assert agent_health.gateway_lifecycle_capability() == _managed()
     assert agent_health.gateway_lifecycle_capability(profile="alpha") == _managed()
-    # Same endpoint, different profile home: never proven -> unmanaged.
-    assert agent_health.gateway_lifecycle_capability(profile="beta") == _unproven()
+    # Same endpoint, different profile home: never proven -> unmanaged. The
+    # start hint names the profile the capability was computed for.
+    assert agent_health.gateway_lifecycle_capability(profile="beta") == _unproven(
+        "hermes --profile beta gateway start"
+    )
     _pin_profile_homes(monkeypatch, home_b, {"alpha": home_a, "beta": home_b})
     assert agent_health.gateway_lifecycle_capability() == _unproven()
 
@@ -847,7 +855,8 @@ def test_unreadable_ownership_record_fails_closed(monkeypatch, tmp_path, payload
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(payload, encoding="utf-8")
 
-    assert agent_health.gateway_lifecycle_capability() == {"managed": False, "reason": expected}
+    expected_result = _unproven() if expected == "local_gateway_unproven" else _external()
+    assert agent_health.gateway_lifecycle_capability() == expected_result
 
 
 def test_ownership_record_never_stores_url_credentials(monkeypatch, tmp_path):
@@ -1159,11 +1168,11 @@ def test_health_restart_and_agent_update_refuse_unproven_loopback_without_subpro
     assert not agent_health._gateway_ownership_record_path().exists()
 
 
-_UNPROVEN = {"managed": False, "reason": "local_gateway_unproven"}
+_UNPROVEN = {"managed": False, "reason": "local_gateway_unproven", "start_command": "hermes gateway start"}
 _ESC_SRC = UI_JS[UI_JS.index("const esc=s=>") : UI_JS.index("\n", UI_JS.index("const esc=s=>"))]
 _EN_LOCAL_UNPROVEN = (
     "WebUI hasn't confirmed this Gateway runs on this machine. "
-    "If it does, start it once with hermes gateway start; WebUI can manage it after that."
+    "If it does, start it once with {cmd}; WebUI can manage it after that."
 )
 
 
@@ -1216,9 +1225,11 @@ def test_renderer_unproven_note_renders_command_as_inline_code_and_stays_escaped
     )
     assert html.count("<code") == 1
     assert ">hermes gateway start</code>" in html
+    assert "{cmd}" not in html
     assert "WebUI hasn&#39;t confirmed this Gateway runs on this machine." in html
+    assert "start it once with <code" in html
 
-    hostile = '<img src=x onerror=alert(1)> then run hermes gateway start "now"'
+    hostile = '<img src=x onerror=alert(1)> then run {cmd} "now"'
     html = _render_gateway_card(
         {**_STATUS_BRANCHES["not_running"], "lifecycle": _UNPROVEN},
         strings={"gateway_local_unproven": hostile},
@@ -1266,9 +1277,227 @@ def test_gateway_local_unproven_copy_exists_once_per_locale_with_external_note()
         match = re.search(r"^\s*gateway_local_unproven: '((?:[^'\\]|\\.)*)',$", body, re.M)
         assert match, name
         values[name] = match.group(1).replace("\\'", "'")
-        # The command stays verbatim so the renderer can show it as code.
-        assert "hermes gateway start" in values[name], name
+        # The renderer puts the server's exact start command (which may carry
+        # --profile <name>) at {cmd}; no locale hard-codes the plain command.
+        assert values[name].count("{cmd}") == 1, name
+        assert "hermes gateway start" not in values[name], name
         assert "`" not in values[name] and "<" not in values[name], name
     assert I18N_JS.count("gateway_local_unproven:") == len(with_external)
     assert values["en"] == _EN_LOCAL_UNPROVEN
     assert all(values[name] != values["en"] for name in with_external if name != "en")
+
+
+# ── follow-up D: the start hint names the target profile ─────────────────
+#
+# Ownership proof is per profile home, and WebUI's own Start button runs
+# ``hermes --profile <name> gateway start`` for a named active profile. Telling
+# a user on profile "work" to run plain ``hermes gateway start`` would start
+# the default profile's Gateway and never prove this one, so the unproven
+# result carries the exact command and the card renders it.
+
+
+def _unproven_capability(monkeypatch, tmp_path, *, active_name="default", profile=None):
+    from api import agent_health
+
+    _pin_profile_homes(monkeypatch, tmp_path / "home", active_name=active_name)
+    monkeypatch.setenv("HERMES_WEBUI_GATEWAY_BASE_URL", "http://127.0.0.1:8642")
+    _pid_switch(monkeypatch, None)
+    return agent_health.gateway_lifecycle_capability(profile=profile)
+
+
+def test_unproven_start_command_is_plain_for_the_default_profile(monkeypatch, tmp_path):
+    cap = _unproven_capability(monkeypatch, tmp_path, active_name="default")
+
+    assert cap == _unproven("hermes gateway start")
+
+
+def test_unproven_start_command_names_the_active_named_profile(monkeypatch, tmp_path):
+    cap = _unproven_capability(monkeypatch, tmp_path, active_name="work")
+
+    assert cap == _unproven("hermes --profile work gateway start")
+    assert cap["managed"] is False
+
+
+@pytest.mark.parametrize(
+    ("profile", "expected"),
+    [
+        ("work", "hermes --profile work gateway start"),
+        ("default", "hermes gateway start"),
+    ],
+)
+def test_unproven_start_command_follows_an_explicit_profile(monkeypatch, tmp_path, profile, expected):
+    # The explicit profile wins over the active one, like the home it checks.
+    cap = _unproven_capability(monkeypatch, tmp_path, active_name="other", profile=profile)
+
+    assert cap == _unproven(expected)
+
+
+@pytest.mark.parametrize("active_name", ["default", "work", "team-2", "", "  work  "])
+def test_unproven_start_command_matches_the_settings_start_button(monkeypatch, tmp_path, active_name):
+    """Same rule as routes._run_gateway_lifecycle_command for every valid name."""
+    from api import config, routes
+
+    agent_dir = _fake_agent(tmp_path)
+    monkeypatch.setattr(config, "_AGENT_DIR", agent_dir)
+    monkeypatch.setattr(config, "PYTHON_EXE", sys.executable)
+    cap = _unproven_capability(monkeypatch, tmp_path, active_name=active_name)
+    ran = []
+    monkeypatch.setattr(
+        routes.subprocess,
+        "run",
+        lambda cmd, **kw: ran.append(cmd) or subprocess.CompletedProcess(cmd, 0, stdout="", stderr=""),
+    )
+
+    routes._run_gateway_lifecycle_command("start")
+
+    assert ran and ran[0][:2] == [sys.executable, str(agent_dir.resolve() / "hermes_cli" / "main.py")]
+    assert ["hermes", *ran[0][2:]] == cap["start_command"].split(" ")
+
+
+@pytest.mark.parametrize(
+    "hostile",
+    [
+        "x; rm -rf /",
+        "work prod",
+        "../etc",
+        "Work",
+        "-x",
+        "--help",
+        "<img src=x onerror=1>",
+        "work\ngateway stop",
+        "a" * 65,
+    ],
+)
+def test_unproven_start_command_never_echoes_an_invalid_profile_name(monkeypatch, tmp_path, hostile):
+    cap = _unproven_capability(monkeypatch, tmp_path, active_name=hostile)
+
+    assert cap == _unproven("hermes gateway start")
+
+
+def test_unproven_start_command_falls_back_when_the_profile_lookup_fails(monkeypatch, tmp_path):
+    from api import agent_health, profiles
+
+    _pin_profile_homes(monkeypatch, tmp_path / "home")
+    monkeypatch.setenv("HERMES_WEBUI_GATEWAY_BASE_URL", "http://127.0.0.1:8642")
+    _pid_switch(monkeypatch, None)
+
+    def boom():
+        raise RuntimeError("profile state unavailable")
+
+    monkeypatch.setattr(profiles, "get_active_profile_name", boom)
+
+    # The hint degrades to the plain command; the reason is unaffected.
+    assert agent_health.gateway_lifecycle_capability() == _unproven("hermes gateway start")
+
+
+def test_managed_and_external_results_carry_no_start_command(monkeypatch, tmp_path):
+    from api import agent_health
+
+    _pin_profile_homes(monkeypatch, tmp_path / "home", active_name="work")
+    pid = _pid_switch(monkeypatch, None)
+
+    # Local-only setup.
+    assert agent_health.gateway_lifecycle_capability() == _managed()
+    # Loopback with a live Gateway, then with persisted proof only.
+    monkeypatch.setenv("HERMES_WEBUI_GATEWAY_BASE_URL", "http://127.0.0.1:8642")
+    pid.pid = 4242
+    assert agent_health.gateway_lifecycle_capability() == _managed()
+    pid.pid = None
+    assert agent_health.gateway_lifecycle_capability() == _managed()
+    # Remote Gateway.
+    monkeypatch.setenv("HERMES_WEBUI_GATEWAY_BASE_URL", "http://gateway.internal:8642")
+    assert agent_health.gateway_lifecycle_capability() == _external()
+
+
+def test_unproven_409_payload_carries_the_named_profile_start_command(monkeypatch, tmp_path):
+    from api import routes
+
+    _pin_profile_homes(monkeypatch, tmp_path / "home", active_name="work")
+    monkeypatch.setenv("HERMES_WEBUI_GATEWAY_BASE_URL", "http://127.0.0.1:8642")
+    _pid_switch(monkeypatch, None)
+    spawned = []
+    monkeypatch.setattr(routes.subprocess, "run", lambda cmd, **kw: spawned.append(cmd))
+
+    handler, data = _call_post(monkeypatch, "/api/gateway/start", {})
+
+    assert handler.status == 409
+    assert data["code"] == "gateway_externally_managed"
+    assert data["lifecycle"] == _unproven("hermes --profile work gateway start")
+    assert spawned == []
+
+
+def _render_unproven_note(lifecycle_extra: dict | None = None, *, strings: dict | None = None) -> str:
+    lifecycle = {"managed": False, "reason": "local_gateway_unproven", **(lifecycle_extra or {})}
+    return _render_gateway_card(
+        {**_STATUS_BRANCHES["not_running"], "lifecycle": lifecycle},
+        strings=strings if strings is not None else {"gateway_local_unproven": _EN_LOCAL_UNPROVEN},
+        esc_src=_ESC_SRC,
+    )
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+@pytest.mark.parametrize(
+    "command",
+    ["hermes --profile work gateway start", "hermes gateway start"],
+)
+def test_renderer_unproven_note_shows_the_server_start_command(command):
+    html = _render_unproven_note({"start_command": command})
+
+    assert html.count("<code") == 1
+    assert f">{command}</code>" in html
+    assert "start it once with <code" in html
+    assert "{cmd}" not in html
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+@pytest.mark.parametrize("bad", [None, "", "   ", 123, ["hermes", "--profile", "work"], {"cmd": "x"}])
+def test_renderer_unproven_note_falls_back_to_the_plain_command(bad):
+    extra = {} if bad is None else {"start_command": bad}
+    html = _render_unproven_note(extra)
+
+    assert html.count("<code") == 1
+    assert ">hermes gateway start</code>" in html
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_renderer_unproven_note_escapes_a_hostile_start_command():
+    html = _render_unproven_note({"start_command": '<img src=x onerror=1>"&'})
+
+    assert "<img" not in html
+    assert html.count("<code") == 1
+    assert ">&lt;img src=x onerror=1&gt;&quot;&amp;</code>" in html
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_renderer_unproven_note_escapes_a_hostile_translation_around_the_command():
+    hostile = '<script>alert(1)</script> {cmd} <b onmouseover="x">'
+    html = _render_unproven_note(
+        {"start_command": "hermes --profile work gateway start"},
+        strings={"gateway_local_unproven": hostile},
+    )
+
+    assert "<script" not in html and "<b " not in html
+    assert "&lt;script&gt;alert(1)&lt;/script&gt;" in html
+    assert "&lt;b onmouseover=&quot;x&quot;&gt;" in html
+    assert html.count("<code") == 1
+    assert ">hermes --profile work gateway start</code>" in html
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_renderer_unproven_note_without_placeholder_adds_no_command():
+    html = _render_unproven_note(
+        {"start_command": "hermes --profile work gateway start"},
+        strings={"gateway_local_unproven": "Start <it> once."},
+    )
+
+    assert "<code" not in html
+    assert "hermes --profile work gateway start" not in html
+    assert "Start &lt;it&gt; once." in html
+
+
+def test_renderer_passes_the_lifecycle_to_the_unproven_note():
+    body = extract_function(PANELS_JS, "_gatewayActionControls").replace(" ", "")
+    assert "_gatewayLocalUnprovenNoteHtml(lifecycle)" in body
+    note = extract_function(PANELS_JS, "_gatewayLocalUnprovenNoteHtml")
+    assert "lifecycle.start_command" in note
+    assert "esc(command)" in note

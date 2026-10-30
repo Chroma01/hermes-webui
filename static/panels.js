@@ -14269,13 +14269,16 @@ function _gatewayLockNote(kind,bodyHtml){
   const icon=typeof li==='function'?`<span style="display:inline-flex;flex-shrink:0;margin-top:2px">${li('lock',12)}</span>`:'';
   return `<div class="gateway-external-note" data-gateway-note="${esc(kind)}" style="display:flex;align-items:flex-start;gap:6px;margin-top:10px;font-size:12px;line-height:1.45;color:var(--muted)">${icon}<span>${bodyHtml}</span></div>`;
 }
-function _gatewayLocalUnprovenNoteHtml(){
-  // Escape the whole translation first, then wrap the verbatim CLI command
-  // (kept untranslated in every locale) in inline code. Only static markup is
-  // added after esc(), so the note stays XSS-safe.
-  const cmd=esc('hermes gateway start');
+function _gatewayLocalUnprovenNoteHtml(lifecycle){
+  // The exact one-time start command comes from the server (it adds
+  // `--profile <name>` for a named profile, like the Start button does).
+  // Escape the whole translation first, then put the escaped command, wrapped
+  // in inline code, at the locale's {cmd} placeholder. Only static markup and
+  // escaped text are added after esc(), so the note stays XSS-safe.
+  const raw=lifecycle&&lifecycle.start_command;
+  const command=(typeof raw==='string'&&raw.trim())?raw:'hermes gateway start';
   const codeStyle='font-family:var(--font-mono,monospace);font-size:11px;background:var(--code-bg);padding:1px 5px;border-radius:4px;white-space:nowrap';
-  return esc(t('gateway_local_unproven')).split(cmd).join(`<code style="${codeStyle}">${cmd}</code>`);
+  return esc(t('gateway_local_unproven')).split('{cmd}').join(`<code style="${codeStyle}">${esc(command)}</code>`);
 }
 function _gatewayActionControls(r){
   // Lifecycle actions drive the LOCAL `hermes gateway` CLI. Offer them only when
@@ -14290,7 +14293,7 @@ function _gatewayActionControls(r){
     // A RUNNING unproven loopback Gateway (e.g. a Docker port map) really is
     // managed elsewhere, so it keeps the external note.
     if(lifecycle&&lifecycle.reason==='local_gateway_unproven'&&!(r&&r.running)){
-      return _gatewayLockNote('local_unproven',_gatewayLocalUnprovenNoteHtml());
+      return _gatewayLockNote('local_unproven',_gatewayLocalUnprovenNoteHtml(lifecycle));
     }
     return _gatewayLockNote('external',esc(t('gateway_external_managed')));
   }
