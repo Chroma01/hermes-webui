@@ -13,12 +13,17 @@ Gateway it is monitoring. These tests pin:
   subprocess when the capability is false;
 * locally managed Gateways keeping today's behaviour;
 * the Settings renderer showing a read-only explanation instead of buttons on
-  every status branch of an external Gateway.
+  every status branch of an external Gateway;
+* a loopback Gateway with no ownership proof yet reporting its own reason
+  (``local_gateway_unproven``, still unmanaged everywhere) so the Settings card
+  can tell a stopped Gateway of this machine to start once with
+  ``hermes gateway start`` (follow-up D).
 """
 
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -177,7 +182,9 @@ def test_capability_is_managed_for_loopback_url_with_running_local_gateway(monke
 
 
 def test_capability_is_unmanaged_for_loopback_url_without_local_gateway_process(monkeypatch):
-    """A loopback URL alone is not proof (Docker port maps, SSH tunnels)."""
+    """A loopback URL alone is not proof (Docker port maps, SSH tunnels). It
+    stays unmanaged, with its own reason so the UI can explain the one-time
+    ``hermes gateway start`` instead of "managed outside WebUI"."""
     from api import agent_health
 
     _no_local_pid(monkeypatch)
@@ -186,7 +193,7 @@ def test_capability_is_unmanaged_for_loopback_url_without_local_gateway_process(
     cap = agent_health.gateway_lifecycle_capability()
 
     assert cap["managed"] is False
-    assert cap["reason"] == "external_gateway"
+    assert cap["reason"] == "local_gateway_unproven"
 
 
 @pytest.mark.parametrize(
@@ -587,6 +594,10 @@ def _external():
     return {"managed": False, "reason": "external_gateway"}
 
 
+def _unproven():
+    return {"managed": False, "reason": "local_gateway_unproven"}
+
+
 def test_loopback_gateway_stopped_by_webui_can_be_started_again(monkeypatch, tmp_path):
     from api import agent_health, config, profiles, routes
 
@@ -738,6 +749,7 @@ def test_loopback_gateway_never_seen_running_stays_read_only(monkeypatch, tmp_pa
 
     assert handler.status == 409
     assert data["code"] == "gateway_externally_managed"
+    assert data["lifecycle"] == _unproven()
     assert spawned == []
 
 
@@ -787,11 +799,12 @@ def test_persisted_proof_is_scoped_to_the_exact_loopback_endpoint(monkeypatch, t
 
     # Another loopback port (e.g. a Docker port map or SSH tunnel) is a
     # different target: the proof does not transfer, and the target change
-    # invalidates it -- going back requires a fresh proof.
+    # invalidates it -- going back requires a fresh proof. Unproven loopback
+    # targets stay unmanaged (their own reason only changes the UI copy).
     monkeypatch.setenv("HERMES_API_URL", "http://127.0.0.1:9642")
-    assert agent_health.gateway_lifecycle_capability() == _external()
+    assert agent_health.gateway_lifecycle_capability() == _unproven()
     monkeypatch.setenv("HERMES_API_URL", "http://127.0.0.1:8642")
-    assert agent_health.gateway_lifecycle_capability() == _external()
+    assert agent_health.gateway_lifecycle_capability() == _unproven()
 
 
 def test_persisted_proof_is_scoped_to_the_profile_home(monkeypatch, tmp_path):
@@ -807,14 +820,24 @@ def test_persisted_proof_is_scoped_to_the_profile_home(monkeypatch, tmp_path):
 
     assert agent_health.gateway_lifecycle_capability() == _managed()
     assert agent_health.gateway_lifecycle_capability(profile="alpha") == _managed()
-    # Same endpoint, different profile home: never proven -> external.
-    assert agent_health.gateway_lifecycle_capability(profile="beta") == _external()
+    # Same endpoint, different profile home: never proven -> unmanaged.
+    assert agent_health.gateway_lifecycle_capability(profile="beta") == _unproven()
     _pin_profile_homes(monkeypatch, home_b, {"alpha": home_a, "beta": home_b})
-    assert agent_health.gateway_lifecycle_capability() == _external()
+    assert agent_health.gateway_lifecycle_capability() == _unproven()
 
 
-@pytest.mark.parametrize("payload", ["{not json", "[]", '{"owners": []}', '{"owners": {"x": 1}}'])
-def test_unreadable_ownership_record_fails_closed(monkeypatch, tmp_path, payload):
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        # Unparseable record: the read raises -> fail closed (external).
+        ("{not json", "external_gateway"),
+        # Parseable but malformed record: reads as empty -> no proof.
+        ("[]", "local_gateway_unproven"),
+        ('{"owners": []}', "local_gateway_unproven"),
+        ('{"owners": {"x": 1}}', "local_gateway_unproven"),
+    ],
+)
+def test_unreadable_ownership_record_fails_closed(monkeypatch, tmp_path, payload, expected):
     from api import agent_health
 
     _pin_profile_homes(monkeypatch, tmp_path / "home")
@@ -824,7 +847,7 @@ def test_unreadable_ownership_record_fails_closed(monkeypatch, tmp_path, payload
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(payload, encoding="utf-8")
 
-    assert agent_health.gateway_lifecycle_capability() == _external()
+    assert agent_health.gateway_lifecycle_capability() == {"managed": False, "reason": expected}
 
 
 def test_ownership_record_never_stores_url_credentials(monkeypatch, tmp_path):
@@ -871,12 +894,14 @@ def test_local_only_setup_never_reads_or_writes_ownership_record(monkeypatch, tm
 # ── frontend ──────────────────────────────────────────────────────────────
 
 
-def _render_gateway_card(status: dict) -> str:
+def _render_gateway_card(status: dict, *, strings: dict | None = None, esc_src: str | None = None) -> str:
     fns = "\n".join(
         extract_function(PANELS_JS, name)
         for name in (
             "_gatewayStatusReason",
             "_gatewayActionButton",
+            "_gatewayLockNote",
+            "_gatewayLocalUnprovenNoteHtml",
             "_gatewayActionControls",
             "_renderGatewayStatus",
         )
@@ -884,8 +909,10 @@ def _render_gateway_card(status: dict) -> str:
     harness = f"""
 const card = {{ innerHTML: '' }};
 const $ = (id) => id === 'gatewayStatusCard' ? card : null;
-const t = (k) => '[' + k + ']';
-const esc = (s) => String(s);
+const _strings = {json.dumps(strings or {})};
+const t = (k) => Object.prototype.hasOwnProperty.call(_strings, k) ? _strings[k] : '[' + k + ']';
+{esc_src or "const esc = (s) => String(s);"}
+const li = (name, size) => '<i data-icon="' + name + '" data-size="' + size + '"></i>';
 const jsArg = (s) => JSON.stringify(s);
 let _gatewayActionInFlight = false;
 {fns}
@@ -947,3 +974,301 @@ def test_health_banner_hides_restart_button_unless_gateway_is_managed():
 
 def test_gateway_external_managed_copy_exists_in_every_locale():
     assert I18N_JS.count("gateway_external_managed:") == 15
+
+
+# ── follow-up D: loopback Gateway with no ownership proof yet ─────────────
+#
+# An install that points WebUI at its own Gateway through a loopback URL and
+# upgrades while that Gateway is stopped has no proof yet. It stays unmanaged
+# (no change to who may start/stop/restart), but reports its own reason so
+# the Settings card can say "start it once with `hermes gateway start`"
+# instead of "managed outside WebUI".
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://127.0.0.1:8642",
+        "http://localhost:8642/health",
+        "http://[::1]:8642/",
+        "https://127.0.0.1:8642",
+    ],
+)
+def test_unproven_loopback_reports_its_own_reason_and_stays_unmanaged(monkeypatch, tmp_path, url):
+    from api import agent_health
+
+    _pin_profile_homes(monkeypatch, tmp_path / "home")
+    monkeypatch.setenv("HERMES_WEBUI_GATEWAY_BASE_URL", url)
+    pid = _pid_switch(monkeypatch, None)
+
+    assert agent_health.gateway_lifecycle_capability() == _unproven()
+    assert pid.calls == [None]
+    # Checking an unproven target never records proof.
+    assert not agent_health._gateway_ownership_record_path().exists()
+
+
+def test_unproven_loopback_becomes_managed_once_its_gateway_is_seen_running(monkeypatch, tmp_path):
+    from api import agent_health
+
+    _pin_profile_homes(monkeypatch, tmp_path / "home")
+    monkeypatch.setenv("HERMES_WEBUI_GATEWAY_BASE_URL", "http://127.0.0.1:8642")
+    pid = _pid_switch(monkeypatch, None)
+    assert agent_health.gateway_lifecycle_capability() == _unproven()
+
+    pid.pid = 4242  # the user ran `hermes gateway start` once
+    assert agent_health.gateway_lifecycle_capability() == _managed()
+    pid.pid = None  # the recorded proof keeps Start available after a stop
+    assert agent_health.gateway_lifecycle_capability() == _managed()
+
+
+def test_loopback_with_persisted_proof_and_no_pid_is_managed(monkeypatch, tmp_path):
+    from api import agent_health
+
+    home = tmp_path / "home"
+    _pin_profile_homes(monkeypatch, home)
+    monkeypatch.setenv("HERMES_WEBUI_GATEWAY_BASE_URL", "http://127.0.0.1:8642")
+    _pid_switch(monkeypatch, None)
+    path = agent_health._gateway_ownership_record_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "version": agent_health._GATEWAY_OWNERSHIP_VERSION,
+                "owners": {str(home.resolve()): {"endpoint": "http://127.0.0.1:8642", "proven_at": "x"}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert agent_health.gateway_lifecycle_capability() == _managed()
+
+
+def test_loopback_with_live_pid_is_managed_not_unproven(monkeypatch, tmp_path):
+    from api import agent_health
+
+    _pin_profile_homes(monkeypatch, tmp_path / "home")
+    monkeypatch.setenv("HERMES_WEBUI_GATEWAY_BASE_URL", "http://127.0.0.1:8642")
+    _pid_switch(monkeypatch, 4242)
+
+    assert agent_health.gateway_lifecycle_capability() == _managed()
+
+
+@pytest.mark.parametrize("url", ["http://gateway.internal:8642", "http://10.0.0.5:8642", "127.0.0.1:8642"])
+def test_non_loopback_without_proof_stays_external_not_unproven(monkeypatch, tmp_path, url):
+    from api import agent_health
+
+    _pin_profile_homes(monkeypatch, tmp_path / "home")
+    monkeypatch.setenv("HERMES_WEBUI_GATEWAY_BASE_URL", url)
+    _pid_switch(monkeypatch, None)
+
+    assert agent_health.gateway_lifecycle_capability() == _external()
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        "get_active_profile_gateway_running_pid",
+        "_gateway_ownership_proven",
+        "_gateway_profile_home_key",
+        "_normalized_gateway_endpoint",
+    ],
+)
+def test_unproven_reason_never_masks_a_failed_check(monkeypatch, tmp_path, target):
+    """Any exception while proving ownership still fails closed to external."""
+    from api import agent_health
+
+    _pin_profile_homes(monkeypatch, tmp_path / "home")
+    monkeypatch.setenv("HERMES_WEBUI_GATEWAY_BASE_URL", "http://127.0.0.1:8642")
+    _pid_switch(monkeypatch, None)
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("probe failed")
+
+    monkeypatch.setattr(agent_health, target, boom)
+
+    assert agent_health.gateway_lifecycle_capability() == _external()
+
+
+@pytest.mark.parametrize(("target", "value"), [("_gateway_profile_home_key", ""), ("_normalized_gateway_endpoint", None)])
+def test_unresolvable_endpoint_or_home_key_stays_external(monkeypatch, tmp_path, target, value):
+    from api import agent_health
+
+    _pin_profile_homes(monkeypatch, tmp_path / "home")
+    monkeypatch.setenv("HERMES_WEBUI_GATEWAY_BASE_URL", "http://127.0.0.1:8642")
+    _pid_switch(monkeypatch, None)
+    monkeypatch.setattr(agent_health, target, lambda *args, **kwargs: value)
+
+    assert agent_health.gateway_lifecycle_capability() == _external()
+
+
+@pytest.mark.parametrize("action", ["start", "stop", "restart"])
+def test_lifecycle_routes_refuse_unproven_loopback_without_subprocess(monkeypatch, tmp_path, action):
+    from api import config, routes
+
+    agent_dir = _fake_agent(tmp_path)
+    monkeypatch.setattr(config, "_AGENT_DIR", agent_dir)
+    monkeypatch.setattr(config, "PYTHON_EXE", sys.executable)
+    _pin_profile_homes(monkeypatch, tmp_path / "home")
+    monkeypatch.setenv("HERMES_WEBUI_GATEWAY_BASE_URL", "http://127.0.0.1:8642")
+    _pid_switch(monkeypatch, None)
+    spawned = []
+    monkeypatch.setattr(routes.subprocess, "run", lambda cmd, **kw: spawned.append(cmd))
+    monkeypatch.setattr(routes.subprocess, "Popen", lambda *a, **kw: spawned.append(a))
+
+    handler, data = _call_post(monkeypatch, f"/api/gateway/{action}", {})
+
+    assert handler.status == 409
+    assert data["ok"] is False
+    assert data["code"] == "gateway_externally_managed"
+    assert data["lifecycle"] == _unproven()
+    assert spawned == []
+    assert routes._GATEWAY_ACTION_LOCK.locked() is False
+
+
+def test_health_restart_and_agent_update_refuse_unproven_loopback_without_subprocess(monkeypatch, tmp_path):
+    import api.gateway_restart as gateway_restart
+    import api.routes as routes
+    import api.updates as upd
+    from api import agent_health
+
+    gateway_restart._GATEWAY_RESTART_LOCK = threading.Lock()
+    _pin_profile_homes(monkeypatch, tmp_path / "home")
+    monkeypatch.setenv("HERMES_WEBUI_GATEWAY_BASE_URL", "http://127.0.0.1:8642")
+    pid = _pid_switch(monkeypatch, None)
+    monkeypatch.setattr(
+        gateway_restart.subprocess,
+        "Popen",
+        lambda *a, **kw: (_ for _ in ()).throw(AssertionError("must not spawn")),
+    )
+    monkeypatch.setattr(upd.time, "sleep", lambda s: None)
+    monkeypatch.setattr(upd, "get_active_profile_gateway_running_pid", pid)
+
+    helper = gateway_restart.restart_active_profile_gateway()
+    assert helper["status"] == "external"
+    assert helper["lifecycle"] == _unproven()
+
+    handler = _FakeHandler()
+    routes._handle_health_restart(handler)
+    assert handler.status == 409
+    assert handler.get_json()["code"] == "gateway_externally_managed"
+
+    ok, result = upd._ensure_gateway_restart_for_agent_update()
+    assert ok is True
+    assert result["status"] == "external"
+    assert gateway_restart._GATEWAY_RESTART_LOCK.locked() is False
+    assert not agent_health._gateway_ownership_record_path().exists()
+
+
+_UNPROVEN = {"managed": False, "reason": "local_gateway_unproven"}
+_ESC_SRC = UI_JS[UI_JS.index("const esc=s=>") : UI_JS.index("\n", UI_JS.index("const esc=s=>"))]
+_EN_LOCAL_UNPROVEN = (
+    "WebUI hasn't confirmed this Gateway runs on this machine. "
+    "If it does, start it once with hermes gateway start; WebUI can manage it after that."
+)
+
+
+def _note_wrapper(html: str) -> str:
+    match = re.search(r'<div class="gateway-external-note"[^>]*>', html)
+    assert match, html
+    return re.sub(r' data-gateway-note="[^"]*"', "", match.group(0))
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+@pytest.mark.parametrize("branch", ["not_running", "unreachable", "not_configured"])
+def test_renderer_unproven_loopback_not_running_shows_one_time_start_note(branch):
+    html = _render_gateway_card({**_STATUS_BRANCHES[branch], "lifecycle": _UNPROVEN})
+
+    assert "[gateway_local_unproven]" in html
+    assert "[gateway_external_managed]" not in html
+    assert 'data-gateway-note="local_unproven"' in html
+    assert "data-gateway-action" not in html
+    assert "_gatewayAction(" not in html
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_renderer_unproven_loopback_running_keeps_external_note():
+    """A running loopback Gateway WebUI cannot prove (e.g. a Docker port map)
+    really is managed elsewhere."""
+    html = _render_gateway_card({**_STATUS_BRANCHES["running"], "lifecycle": _UNPROVEN})
+
+    assert "[gateway_external_managed]" in html
+    assert "[gateway_local_unproven]" not in html
+    assert 'data-gateway-note="external"' in html
+    assert "data-gateway-action" not in html
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_renderer_unproven_note_uses_the_external_note_lock_markup():
+    unproven = _render_gateway_card({**_STATUS_BRANCHES["not_running"], "lifecycle": _UNPROVEN})
+    external = _render_gateway_card({**_STATUS_BRANCHES["not_running"], "lifecycle": _EXTERNAL})
+
+    assert _note_wrapper(unproven) == _note_wrapper(external)
+    assert '<i data-icon="lock" data-size="12"></i>' in unproven
+    assert '<i data-icon="lock" data-size="12"></i>' in external
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_renderer_unproven_note_renders_command_as_inline_code_and_stays_escaped():
+    html = _render_gateway_card(
+        {**_STATUS_BRANCHES["not_running"], "lifecycle": _UNPROVEN},
+        strings={"gateway_local_unproven": _EN_LOCAL_UNPROVEN},
+        esc_src=_ESC_SRC,
+    )
+    assert html.count("<code") == 1
+    assert ">hermes gateway start</code>" in html
+    assert "WebUI hasn&#39;t confirmed this Gateway runs on this machine." in html
+
+    hostile = '<img src=x onerror=alert(1)> then run hermes gateway start "now"'
+    html = _render_gateway_card(
+        {**_STATUS_BRANCHES["not_running"], "lifecycle": _UNPROVEN},
+        strings={"gateway_local_unproven": hostile},
+        esc_src=_ESC_SRC,
+    )
+    assert "<img" not in html
+    assert "&lt;img src=x onerror=alert(1)&gt;" in html
+    assert "&quot;now&quot;" in html
+    assert ">hermes gateway start</code>" in html
+
+
+def test_renderer_unproven_branch_keys_on_reason_and_running():
+    body = extract_function(PANELS_JS, "_gatewayActionControls").replace(" ", "")
+    assert "lifecycle.reason==='local_gateway_unproven'&&!(r&&r.running)" in body
+    assert "t('gateway_external_managed')" in body
+
+
+def _locale_blocks() -> dict[str, str]:
+    blocks: dict[str, list[str]] = {}
+    current = None
+    for line in I18N_JS.splitlines():
+        match = re.match(r"^  (['\"]?[A-Za-z_-]+['\"]?)\s*:\s*\{\s*$", line)
+        if match:
+            current = match.group(1).strip("'\"")
+            blocks[current] = []
+            continue
+        if current is not None and re.match(r"^\S", line):
+            current = None  # end of the LOCALES object
+            continue
+        if current is not None:
+            blocks[current].append(line)
+    return {name: "\n".join(lines) for name, lines in blocks.items()}
+
+
+def test_gateway_local_unproven_copy_exists_once_per_locale_with_external_note():
+    blocks = _locale_blocks()
+    with_external = [name for name, body in blocks.items() if "gateway_external_managed:" in body]
+    assert len(with_external) == 15
+
+    values = {}
+    for name in with_external:
+        body = blocks[name]
+        assert body.count("gateway_external_managed:") == 1, name
+        assert body.count("gateway_local_unproven:") == 1, name
+        match = re.search(r"^\s*gateway_local_unproven: '((?:[^'\\]|\\.)*)',$", body, re.M)
+        assert match, name
+        values[name] = match.group(1).replace("\\'", "'")
+        # The command stays verbatim so the renderer can show it as code.
+        assert "hermes gateway start" in values[name], name
+        assert "`" not in values[name] and "<" not in values[name], name
+    assert I18N_JS.count("gateway_local_unproven:") == len(with_external)
+    assert values["en"] == _EN_LOCAL_UNPROVEN
+    assert all(values[name] != values["en"] for name in with_external if name != "en")

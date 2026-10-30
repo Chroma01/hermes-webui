@@ -710,9 +710,17 @@ def gateway_lifecycle_capability(profile: str | None = None) -> dict[str, Any]:
       persisted proof keeps Start available after Stop/crash and lets a failed
       restart be retried. A loopback URL alone is not proof: Docker port maps
       and SSH tunnels also answer on 127.0.0.1.
+    * A loopback URL with a resolvable endpoint and profile home but no proof
+      yet (no live Gateway PID for the profile, no persisted record for this
+      home + endpoint) -> not managed (``local_gateway_unproven``). Only the
+      reason differs from ``external_gateway``, so the UI can tell a stopped
+      Gateway of this machine (start it once with ``hermes gateway start``)
+      apart from one that runs elsewhere; every lifecycle entrypoint still
+      refuses it.
     * Anything else with a remote URL -> not managed (``external_gateway``).
 
-    Fail-closed: any error while proving local ownership reports unmanaged.
+    Fail-closed: any error while proving local ownership, or an endpoint or
+    profile home that does not resolve, reports ``external_gateway``.
     """
     remote_base = _remote_gateway_base_url()
     if remote_base is None:
@@ -730,6 +738,10 @@ def gateway_lifecycle_capability(profile: str | None = None) -> dict[str, Any]:
                     return {"managed": True, "reason": "local_gateway"}
                 if _gateway_ownership_proven(home_key, endpoint):
                     return {"managed": True, "reason": "local_gateway"}
+                # Loopback, but never seen running for this home + endpoint
+                # (e.g. upgraded while the Gateway was stopped). Still
+                # unmanaged; the distinct reason only changes the UI copy.
+                return {"managed": False, "reason": "local_gateway_unproven"}
     except Exception:
         pass
     return {"managed": False, "reason": "external_gateway"}
