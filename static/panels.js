@@ -14278,7 +14278,12 @@ function _gatewayLocalUnprovenNoteHtml(lifecycle){
   const raw=lifecycle&&lifecycle.start_command;
   const command=(typeof raw==='string'&&raw.trim())?raw:'hermes gateway start';
   const codeStyle='font-family:var(--font-mono,monospace);font-size:11px;background:var(--code-bg);padding:1px 5px;border-radius:4px;white-space:pre-wrap;overflow-wrap:anywhere;-webkit-box-decoration-break:clone;box-decoration-break:clone';
-  return esc(t('gateway_local_unproven')).split('{cmd}').join(`<code style="${codeStyle}">${esc(command)}</code>`);
+  // Keep each `--flag` whole when the chip wraps: a break inside `--profile`
+  // left a bare `--` at the line end, which reads as the end-of-options marker.
+  // The pattern only matches `--` plus letters/hyphens in the already escaped
+  // text, so it cannot touch an entity or markup.
+  const cmdHtml=esc(command).replace(/(^|\s)(--[a-z][a-z-]*)/g,'$1<span style="white-space:nowrap">$2</span>');
+  return esc(t('gateway_local_unproven')).split('{cmd}').join(`<code style="${codeStyle}">${cmdHtml}</code>`);
 }
 function _gatewayActionControls(r){
   // Lifecycle actions drive the LOCAL `hermes gateway` CLI. Offer them only when

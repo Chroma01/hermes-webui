@@ -1258,6 +1258,32 @@ def test_renderer_unproven_command_chip_wraps_instead_of_overflowing_the_card():
     assert "overflow-wrap:anywhere" in style
 
 
+def test_renderer_unproven_command_keeps_the_profile_flag_whole():
+    # The chip may wrap, but never inside `--profile` (a bare `--` at a line end
+    # reads as the end-of-options marker). The name after it may still wrap.
+    name = "personal-assistant-macos"
+    html = _render_gateway_card(
+        {**_STATUS_BRANCHES["not_running"], "lifecycle": {
+            **_UNPROVEN, "start_command": f"hermes --profile {name} gateway start"}},
+        strings={"gateway_local_unproven": _EN_LOCAL_UNPROVEN},
+        esc_src=_ESC_SRC,
+    )
+    assert '<span style="white-space:nowrap">--profile</span>' in html
+    assert f"--profile</span> {name} gateway start</code>" in html
+    text = re.sub(r"<[^>]+>", "", re.search(r"<code[^>]*>(.*?)</code>", html).group(1))
+    assert text == f"hermes --profile {name} gateway start"
+
+    hostile = _render_gateway_card(
+        {**_STATUS_BRANCHES["not_running"], "lifecycle": {
+            **_UNPROVEN, "start_command": "hermes --<img src=x onerror=1> --a\"b"}},
+        strings={"gateway_local_unproven": _EN_LOCAL_UNPROVEN},
+        esc_src=_ESC_SRC,
+    )
+    assert "<img" not in hostile
+    assert "--&lt;img src=x onerror=1&gt;" in hostile
+    assert '<span style="white-space:nowrap">--a</span>&quot;b' in hostile
+
+
 def test_renderer_unproven_branch_keys_on_reason_and_running():
     body = extract_function(PANELS_JS, "_gatewayActionControls").replace(" ", "")
     assert "lifecycle.reason==='local_gateway_unproven'&&!(r&&r.running)" in body
@@ -1452,6 +1478,13 @@ def _render_unproven_note(lifecycle_extra: dict | None = None, *, strings: dict 
     )
 
 
+def _code_text(html: str) -> str:
+    """Text of the note's single <code> chip, with the nowrap flag spans removed."""
+    m = re.search(r"<code[^>]*>(.*?)</code>", html)
+    assert m, html
+    return re.sub(r"<[^>]+>", "", m.group(1))
+
+
 @pytest.mark.skipif(NODE is None, reason="node not on PATH")
 @pytest.mark.parametrize(
     "command",
@@ -1461,7 +1494,7 @@ def test_renderer_unproven_note_shows_the_server_start_command(command):
     html = _render_unproven_note({"start_command": command})
 
     assert html.count("<code") == 1
-    assert f">{command}</code>" in html
+    assert _code_text(html) == command
     assert "start it once with <code" in html
     assert "{cmd}" not in html
 
@@ -1497,7 +1530,7 @@ def test_renderer_unproven_note_escapes_a_hostile_translation_around_the_command
     assert "&lt;script&gt;alert(1)&lt;/script&gt;" in html
     assert "&lt;b onmouseover=&quot;x&quot;&gt;" in html
     assert html.count("<code") == 1
-    assert ">hermes --profile work gateway start</code>" in html
+    assert _code_text(html) == "hermes --profile work gateway start"
 
 
 @pytest.mark.skipif(NODE is None, reason="node not on PATH")
