@@ -2926,20 +2926,21 @@ def settle_gateway_stream_approvals(session_id: str, stream_id: str, *, reason: 
 def _submit_stream_approval_mirror(session_id: str, approval_data: dict, cancel_event) -> tuple[dict | None, int]:
     """Publish a default-stream approval card unless its stream is being stopped.
 
-    The caller maps the stream to the card's run (``_STREAM_RUN_IDS``) first, and
-    Stop sets the cancel flag before it reads that mapping to retire the run's
-    cards. So with no lock: if the flag is still clear after the card is
-    published, Stop has not set it yet, and its later read of the mapping finds
-    this run and retires the card; if it is set, this call retires the card
-    itself. Either way a stopped run never keeps a clickable card. (A click
-    that validated the card in the instant before it was retired still relays
-    once; that is a click that happened before Stop, not after it.)
+    Stop sets the cancel flag and then retires the run's cards under the approval
+    registry lock. The insertion re-checks the flag under that same lock
+    (``submit_gateway_pending_mirror(..., cancel_event=...)``), so either the
+    card is inserted before Stop's retirement (which then removes it) or the
+    insertion sees the flag and publishes nothing. No card can appear after
+    Stop has returned, not even before the recheck below. The recheck after
+    publishing stays as a second line of defence. (A click that validated the
+    card in the instant before it was retired still relays once; that is a
+    click that happened before Stop, not after it.)
     """
     from api.route_approvals import settle_gateway_pending_run, submit_gateway_pending_mirror
 
     if cancel_event.is_set():
         return None, 0
-    head, total = submit_gateway_pending_mirror(session_id, approval_data)
+    head, total = submit_gateway_pending_mirror(session_id, approval_data, cancel_event=cancel_event)
     run_id = str(approval_data.get("run_id") or "").strip()
     if run_id and cancel_event.is_set():
         settle_gateway_pending_run(
