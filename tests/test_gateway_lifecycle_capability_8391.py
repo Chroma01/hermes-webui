@@ -1241,6 +1241,23 @@ def test_renderer_unproven_note_renders_command_as_inline_code_and_stays_escaped
     assert ">hermes gateway start</code>" in html
 
 
+def test_renderer_unproven_command_chip_wraps_instead_of_overflowing_the_card():
+    # A profile id can be up to 64 characters; a no-wrap chip pushed the whole
+    # Settings page sideways at phone width (Fable #8633 r1). The chip must wrap.
+    html = _render_gateway_card(
+        {**_STATUS_BRANCHES["not_running"], "lifecycle": {
+            **_UNPROVEN, "start_command": "hermes --profile " + "p" * 64 + " gateway start"}},
+        strings={"gateway_local_unproven": _EN_LOCAL_UNPROVEN},
+        esc_src=_ESC_SRC,
+    )
+    code_open = re.search(r'<code style="([^"]*)">', html)
+    assert code_open, html
+    style = code_open.group(1).replace(" ", "")
+    assert "white-space:nowrap" not in style
+    assert "white-space:pre-wrap" in style
+    assert "overflow-wrap:anywhere" in style
+
+
 def test_renderer_unproven_branch_keys_on_reason_and_running():
     body = extract_function(PANELS_JS, "_gatewayActionControls").replace(" ", "")
     assert "lifecycle.reason==='local_gateway_unproven'&&!(r&&r.running)" in body
